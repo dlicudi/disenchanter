@@ -1,0 +1,10 @@
+## Interface: 20506
+## Title: Disenchanter
+## Notes: Guarded one-click disenchanting — lists what's safe, holds back what isn't.
+## Author: dlicudi
+## Version: 0.1.0
+## SavedVariables: DisenchanterDB
+## X-Category: Professions
+## OptionalDeps: Auctionator, Pawn, ItemRack, TradeSkillMaster
+
+Disenchanter.lua

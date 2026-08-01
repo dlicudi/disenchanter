@@ -1,0 +1,9 @@
+{
+  "name": "disenchanter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WoW Classic guarded one-click disenchanting addon",
+  "scripts": {
+    "sync-addon": "./sync.sh"
+  }
+}
