@@ -30,6 +30,12 @@
   change every row is disarmed until the list has been rebuilt, so a row can
   never fire at an item that has since moved into that slot.
 
+  If a LibDataBroker display is installed (Titan Panel, Bazooka, ...) a
+  "Disenchanter" plugin appears showing the safe / check-first counts; click
+  opens the window, right-click prints the chat report. No libraries are
+  bundled — the object registers only when another addon provides LDB, and
+  everything else works the same without it.
+
   Commands:
      /de                      open the window
      /de scan                 print the verdicts to chat
@@ -387,8 +393,11 @@ function DE.Scan()
   for bag = 0, NUM_BAG_SLOTS or 4 do
     for slot = 1, (C.GetContainerNumSlots(bag) or 0) do
       local info = C.GetContainerItemInfo(bag, slot)
-      -- Locked items are mid-move or mid-cast; leave them alone.
-      if info and info.itemID and not info.isLocked then
+      local casting = DE.cast and info and DE.cast.bag == bag and DE.cast.slot == slot
+        and DE.cast.itemID == info.itemID
+      -- Locked items are mid-move or mid-cast; leave them alone — except the
+      -- slot our own cast locked, which stays listed so its row can show progress.
+      if info and info.itemID and (casting or not info.isLocked) then
         -- GetItemInfo is nil until the client caches the item; the call itself
         -- requests it and GET_ITEM_INFO_RECEIVED repaints, so a skipped item
         -- reappears a moment later.
@@ -409,6 +418,7 @@ function DE.Scan()
             isQuest = isQuestItem(bag, slot, info.itemID),
             useSpell = (GetItemSpell and GetItemSpell(info.itemID)) or nil,
             rackSet = rack[info.itemID],
+            casting = casting or nil,
           }
           it.beats = db().guards.upgrade and beatsEquipped(invType, ilvl, classID, subID) or nil
           it.pawnUpgrade = db().guards.pawn and pawnSaysUpgrade(it.link) or false
@@ -614,6 +624,16 @@ local function itemRow(i)
   row:RegisterForClicks("AnyUp", "AnyDown")
   row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
 
+  -- The in-row cast bar: a translucent fill that sweeps across the row while
+  -- your Disenchant is casting on its item. BACKGROUND layer, so the icon and
+  -- text stay readable on top of it.
+  row.castFill = row:CreateTexture(nil, "BACKGROUND")
+  row.castFill:SetPoint("TOPLEFT")
+  row.castFill:SetPoint("BOTTOMLEFT")
+  row.castFill:SetColorTexture(0.64, 0.21, 0.93, 0.35)
+  row.castFill:SetWidth(1)
+  row.castFill:Hide()
+
   row.icon = row:CreateTexture(nil, "ARTWORK")
   row.icon:SetSize(22, 22)
   row.icon:SetPoint("LEFT", 2, 0)
@@ -764,6 +784,7 @@ function DE.Refresh()
   local safe, confirm, blocked = DE.Scan()
   local lists = { safe = safe, confirm = confirm, blocked = blocked }
 
+  win.castingRow = nil
   local hi, ri, y = 0, 0, 0
   for _, b in ipairs(BUCKETS) do
     local list = lists[b.key]
@@ -785,15 +806,21 @@ function DE.Refresh()
         row.icon:SetDesaturated(it.tier == "blocked")
         row.name:SetText(("%s%s|r%s  |cff888888i%d|r"):format(
           qcolor(it.quality), it.name, it.count > 1 and (" x" .. it.count) or "", it.ilvl))
-        if it.tier == "safe" then
+        if it.casting then
+          row.note:SetText("|cffb37ce8Disenchanting...|r")
+        elseif it.tier == "safe" then
           row.note:SetText("|cff777777" .. (it.yield or "") .. "|r")
         else
           row.note:SetText((it.tier == "confirm" and "|cffbfa640Ctrl-click: " or "|cffbf5555")
             .. (it.reason or "") .. "|r")
         end
+        row.castFill:SetShown(it.casting and true or false)
+        if it.casting then win.castingRow = row end
         row.lock:SetNormalTexture(db().keep.items[it.itemID] and LOCKED or UNLOCKED)
         row.allow:SetShown(it.tier == "blocked" and not it.permanent)
-        arm(row, it.tier, it.bag, it.slot)
+        -- A casting row is never armed: its item is locked, so a second click
+        -- could only produce an error mid-cast.
+        arm(row, it.casting and "blocked" or it.tier, it.bag, it.slot)
         row:ClearAllPoints(); row:SetPoint("TOPLEFT", 0, y)
         row:Show()
         y = y - ROW_H
@@ -995,6 +1022,14 @@ local function ensureWindow()
   report:SetPoint("BOTTOMRIGHT", -14, 14)
   report:SetScript("OnClick", function() DE.Report() end)
 
+  -- Sweeps the casting row's fill each frame; a no-op the rest of the time.
+  f:SetScript("OnUpdate", function()
+    local row, c = win.castingRow, DE.cast
+    if not (row and c and row:IsShown()) then return end
+    local prog = math.min((GetTime() - c.startTime) / (c.duration > 0 and c.duration or 1), 1)
+    row.castFill:SetWidth(math.max(prog * ROW_W, 0.01))
+  end)
+
   -- CreateFrame hands back a *shown* frame, so without this the first /de would
   -- toggle the window straight to hidden and OnShow would never fire.
   f:Hide()
@@ -1004,6 +1039,40 @@ end
 function DE.Toggle()
   local f = ensureWindow()
   if f:IsShown() then f:Hide() else f:Show() end
+end
+
+--------------------------------------------------------------------------------
+-- Cast progress. While a Disenchant this addon started is casting, DE.cast
+-- holds which bag slot and the timing; Scan keeps that (locked) slot in the
+-- list, Refresh flags its row, and the window's OnUpdate sweeps the row's fill.
+-- Timing comes from UnitCastingInfo, so haste and pushback are honoured.
+--------------------------------------------------------------------------------
+--- @param update true when re-reading the times mid-cast (spell pushback)
+function DE.CastStarted(update)
+  if update and not DE.cast then return end
+  local startMS, endMS
+  if UnitCastingInfo then
+    local ok, _, _, _, s, e = pcall(UnitCastingInfo, "player")
+    if ok then startMS, endMS = s, e end
+  end
+  local c = DE.cast
+  if not update then
+    local it = (GetTime() - (DE._pendingAt or 0) < 3) and DE._pending or nil
+    if not it then return end -- a Disenchant this addon didn't start; not ours to paint
+    c = { itemID = it.itemID, bag = it.bag, slot = it.slot }
+    DE.cast = c
+  end
+  c.startTime = startMS and (startMS / 1000) or GetTime()
+  c.duration = (startMS and endMS and endMS > startMS) and ((endMS - startMS) / 1000) or 3
+  DE.Refresh()
+end
+
+--- The cast ended — completed, interrupted or cancelled alike. The row either
+--- vanishes with its item (success) or snaps back to normal (anything else).
+function DE.CastFinished()
+  if not DE.cast then return end
+  DE.cast = nil
+  DE.Refresh()
 end
 
 --- Everything needed to work out why a click didn't cast. Lives down here, not
@@ -1108,6 +1177,51 @@ function DE.DeleteKeep(n)
 end
 
 --------------------------------------------------------------------------------
+-- LibDataBroker feed, for Titan Panel and every other LDB display (Bazooka,
+-- ChocolateBar, ...). Nothing is bundled: the object is registered only if
+-- some other addon has already put LibStub + LDB in the world — Titan ships
+-- its own copy — and the addon behaves identically without it.
+--------------------------------------------------------------------------------
+local broker
+
+function DE.InitBroker()
+  if broker then return end
+  local ldb = LibStub and LibStub.GetLibrary and LibStub:GetLibrary("LibDataBroker-1.1", true)
+  if not ldb then return end
+  broker = ldb:NewDataObject("Disenchanter", {
+    type = "data source",
+    label = "Disenchanter",
+    icon = "Interface\\Icons\\Spell_Holy_RemoveCurse",
+    text = "…",
+    OnClick = function(_, button)
+      if button == "RightButton" then DE.Report() else DE.Toggle() end
+    end,
+    OnTooltipShow = function(tt)
+      local safe, confirm, blocked = DE.Scan()
+      tt:AddLine("Disenchanter")
+      tt:AddDoubleLine("Safe to disenchant", #safe, 0.2, 0.8, 0.27, 1, 1, 1)
+      tt:AddDoubleLine("Check first", #confirm, 1, 0.82, 0, 1, 1, 1)
+      tt:AddDoubleLine("Protected", #blocked, 1, 0.33, 0.33, 1, 1, 1)
+      local first = true
+      for link, count in pairs(DE.tally) do
+        if first then tt:AddLine(" "); tt:AddLine("Disenchanted this session:"); first = false end
+        tt:AddDoubleLine(link, "x" .. count, 1, 1, 1, 0.8, 0.8, 0.8)
+      end
+      tt:AddLine(" ")
+      tt:AddLine("|cff888888Click to open the window — right-click for a chat report.|r")
+    end,
+  })
+  DE.UpdateBroker()
+end
+
+--- Refresh the panel text: green safe count, amber check-first count.
+function DE.UpdateBroker()
+  if not broker then return end
+  local safe, confirm = DE.Scan()
+  broker.text = ("|cff33cc44%d|r |cffffd100%d|r"):format(#safe, #confirm)
+end
+
+--------------------------------------------------------------------------------
 -- Events.
 --------------------------------------------------------------------------------
 local ev = CreateFrame("Frame")
@@ -1119,6 +1233,11 @@ ev:RegisterEvent("PLAYER_REGEN_ENABLED")
 ev:RegisterEvent("PLAYER_REGEN_DISABLED")
 ev:RegisterEvent("UI_ERROR_MESSAGE")
 ev:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+ev:RegisterEvent("UNIT_SPELLCAST_START")
+ev:RegisterEvent("UNIT_SPELLCAST_DELAYED")
+ev:RegisterEvent("UNIT_SPELLCAST_STOP")
+ev:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
+ev:RegisterEvent("UNIT_SPELLCAST_FAILED")
 ev:RegisterEvent("CHAT_MSG_LOOT")
 
 -- Coalesce the burst of BAG_UPDATEs a disenchant produces into one rebuild.
@@ -1126,12 +1245,13 @@ local pending
 local function queueRefresh()
   if pending then return end
   pending = true
-  C_Timer.After(0.1, function() pending = nil; DE.Refresh() end)
+  C_Timer.After(0.1, function() pending = nil; DE.Refresh(); DE.UpdateBroker() end)
 end
 
 ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
   if event == "PLAYER_LOGIN" then
     db()
+    DE.InitBroker()
     if not knowsDisenchant() then
       -- Still perfectly usable as a "what would this give me" viewer, so this
       -- is a note, not a refusal to load.
@@ -1155,7 +1275,23 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     queueRefresh()
 
   elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
-    if a1 == "player" and a3 == DE_SPELL then lastDE = GetTime() end
+    if a1 == "player" and a3 == DE_SPELL then
+      lastDE = GetTime()
+      DE.CastFinished()
+    end
+
+  elseif event == "UNIT_SPELLCAST_START" then
+    if a1 == "player" and a3 == DE_SPELL then DE.CastStarted() end
+
+  elseif event == "UNIT_SPELLCAST_DELAYED" then
+    if a1 == "player" and a3 == DE_SPELL then DE.CastStarted(true) end
+
+  elseif event == "UNIT_SPELLCAST_STOP" or event == "UNIT_SPELLCAST_INTERRUPTED"
+      or event == "UNIT_SPELLCAST_FAILED" then
+    -- STOP also follows a success, but by then SUCCEEDED has already cleared
+    -- DE.cast, so this only catches casts that died early. FAILED with no
+    -- START (e.g. "can't be disenchanted") is ignored the same way.
+    if a1 == "player" and a3 == DE_SPELL then DE.CastFinished() end
 
   elseif event == "CHAT_MSG_LOOT" then
     noteLoot(a1 or "")
