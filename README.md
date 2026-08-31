@@ -19,6 +19,50 @@ greens is: click the top row, wait for the cast, click the new top row.
 Each row shows what it's likely to turn into (`Arcane Dust / Greater Planar
 Essence / Small Prismatic Shard`) or, if it's held back, why.
 
+## The Trash tab
+
+The same idea pointed at deletion, for when the bags are full and there's no
+vendor in sight. `/de trash` (or the **Trash** tab in the window) lists the
+grey and white items in your bags, sorted **lowest vendor value first** — the
+top row is always the cheapest thing to lose. Each row shows what deleting it
+forfeits.
+
+- **Click deletes a grey.** Gone for good; the chat line says what it was worth.
+- **Whites need a Ctrl-click** — consumables you might still want live here.
+- **Protected** works as on the other tab: the keep list and quest guard apply,
+  and the value guard protects any stack worth more than `/de value` (market
+  price if Auctionator/TSM is installed) until you press Allow. Hearthstone is
+  never listed at all.
+
+Deletion happens off the cursor (`PickupContainerItem` + `DeleteCursorItem`),
+so it needs no free bag slot. The slot is re-read at the instant of the click
+and rows disarm the moment bags change, same as disenchanting — a click can
+only ever destroy the exact item its row was showing. Deletions are recorded
+in `/de audit` as `item → deleted`; shard splits ignore them.
+
+## The Run tab
+
+For dungeon and raid nights where you're the designated disenchanter — the
+audit on screen instead of scrolling away in chat. `/de run` (or the **Run**
+tab) shows:
+
+- **Materials this run** — every material produced since the run marker, with
+  the split for the current group on each row: `[Large Prismatic Shard] x13 —
+  2 each for 5 members, 3 spare`.
+- **Log** — the drops newest-first: what was consumed → what it produced, the
+  time, the zone, and your group size at that moment.
+
+The numbers come from the audit log, never from your bags — so the shards you
+walked in with, bank stock, and mail arrivals are all invisible to it. Only
+loot attributed to **your** Disenchant casts is counted.
+
+Press **New run** as the run begins: it moves the marker to now (same marker
+as `/de split start`). Earlier disenchants stay in `/de audit` but stop
+counting toward this run. **Announce** posts the totals and shares to
+party/raid chat — the only time the addon ever speaks, and only on that click.
+The split uses the roster at the moment you announce; who was present for
+which boss is the loot master's call, not arithmetic.
+
 ## Safety
 
 The addon never casts anything. Each row is a Blizzard secure button carrying a
@@ -26,12 +70,23 @@ plain macro:
 
 ```
 /cast Disenchant
-/use <bag> <slot>
 ```
 
 That macro only ever runs on **your** click, on the row **you** clicked —
 Blizzard's protected-call rules make anything else impossible. There is no
 automation loop and no "disenchant everything" button.
+
+The macro deliberately stops there — there is no `/use <bag> <slot>` line.
+A macro doesn't halt when `/cast` fails, so on a character without Disenchant
+(or while you're already casting, or dead) a `/use` line would run on its own
+and equip the item, sell it to an open vendor, attach it to an open mail, or
+drop it into a trade. Instead the item is named by the button's `target-bag` /
+`target-slot` attributes. Blizzard's own secure handler reads those after the
+action and applies the spell only if `SpellCanTargetItem()` — that is, only if
+the cast actually put Disenchant on the cursor. If the click didn't start a
+cast, the item is never touched. (`UseContainerItem` is a protected call on
+this client, so the addon can't do this step itself — it's the secure
+template's job, same as the default bag UI.)
 
 Rows are registered for any button (`RegisterForClicks("AnyUp", "AnyDown")`),
 because this client's secure handler acts on whichever click edge
@@ -50,7 +105,8 @@ Two things stop a click going to the wrong item:
   than a lost epic.
 
 If the server ever says an item can't be disenchanted, that item id is
-remembered and never offered again.
+remembered and never offered again — `/de learned` lists those items and
+`/de learned clear` forgets them, in case one was misattributed.
 
 ## Guards
 
@@ -78,6 +134,8 @@ keep list, and it survives logout.
 
 ```
 /de                       open the window
+/de trash                 open the window on the Trash tab
+/de run                   open the window on the Run tab
 /de scan                  print the verdicts to chat
 /de keep <#id|name:text>  never disenchant this
 /de keep del <n>          drop keep-list entry n
@@ -86,23 +144,54 @@ keep list, and it survives logout.
 /de ilvl <n>              item level that needs a Ctrl-click (0 = off)
 /de confirm <green|blue|epic>   quality above which a Ctrl-click is needed
 /de guard [name]          list guards, or toggle one
+/de learned [clear]       items the server refused; clear forgets them
 /de tally                 what you've disenchanted this session
+/de audit [n|clear]       the log: what → what, when, where, group size
+/de split [start|say|party|raid]   divide shards since the marker
 /de mode                  swap how a row fires (see below)
 /de debug                 client/spell/attribute dump, and toggle click tracing
 ```
 
 ### /de mode
 
-`macro` (default) puts `/cast` + `/use` in one macrotext, entirely inside the
-secure handler. `spell` casts Disenchant from the secure button and lets
-`PostClick` apply it with `UseContainerItem`, which isn't a protected call.
-Both work; the second exists in case a patch breaks macrotext.
+`macro` (default) issues the cast through a `/cast Disenchant` macrotext;
+`spell` issues it through the button's `spell` attribute. In both modes the
+item is applied by the secure template's `target-bag` / `target-slot`
+handling, only while Disenchant is on the cursor. Both work; the second exists
+in case a patch breaks macrotext.
 
 `/de debug` prints what the spell name resolved to, which attributes actually
 landed on row 1, and whether the button is protected — then toggles a trace that
 prints a `PRE`/`POST` pair per click. If `PRE` fires and `POST` shows nothing
 casting and no spell on the cursor, the secure handler ran but performed
 nothing, which is a click-registration problem rather than a macro one.
+
+## Audit and shard splits
+
+Every completed disenchant is written to a saved log: what was consumed, what
+it produced, when, in which zone, and how big your group was at the time.
+`/de audit` shows the last 20 entries (`/de audit 50` for more, `/de audit
+clear` to wipe it). The log keeps the newest 300 entries.
+
+For dungeon and raid runs where you're the designated disenchanter:
+
+```
+/de split start     set the marker as the run begins
+/de split           totals since the marker, divided by the current group
+/de split party     the same, announced to the group (raid-aware)
+```
+
+The output is per-material: `[Large Prismatic Shard] x13 — 2 each, 3 spare`.
+The division uses the roster *at the moment you ask* — who was present for
+which boss is the loot master's call, not arithmetic. And in keeping with the
+house rule, nothing is ever announced to chat except on the explicit
+`say`/`party`/`raid` argument.
+
+Two honest caveats: the log only sees **your** casts, and a loot line is
+attributed to a disenchant by landing within ~3 seconds of your cast
+finishing — only your own loot lines are considered, so a party member
+looting at that instant can't pollute it, but you looting a mob mid-cast
+still could.
 
 ## Optional integrations
 

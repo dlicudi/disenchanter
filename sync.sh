@@ -1,8 +1,10 @@
 #!/bin/sh
-# Copy the addon into the live WoW AddOns directory (the installed addon is a
-# copy — after syncing, /reload in game).
+# Copy the addon into the live WoW AddOns directories (the installed addon is a
+# copy — after syncing, /reload in game; a brand-new install needs a client restart).
 set -e
-DEST="/Applications/World of Warcraft/_anniversary_/Interface/AddOns/Disenchanter"
-mkdir -p "$DEST"
-cp Disenchanter.toc Disenchanter.lua "$DEST/"
-echo "synced to $DEST"
+for FLAVOR in _anniversary_ _classic_era_; do
+  DEST="/Applications/World of Warcraft/$FLAVOR/Interface/AddOns/Disenchanter"
+  mkdir -p "$DEST"
+  cp Disenchanter.toc Disenchanter.lua "$DEST/"
+  echo "synced to $DEST"
+done
