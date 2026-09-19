@@ -79,6 +79,20 @@ local DE = {}
 Disenchanter = DE -- global, mostly for /dump poking
 
 local C = C_Container
+
+--- The 1.60 Classic client finished a migration the older builds hadn't started:
+--- the loose item/spell/money globals now live in C_Item, C_SpellBook and
+--- C_CurrencyInfo, and the globals are simply gone. These locals shadow the
+--- globals with whichever spelling the running client has, so every call site
+--- below stays written the old way and works on all three flavours.
+local GetItemInfo         = GetItemInfo         or (C_Item and C_Item.GetItemInfo)
+local GetItemInfoInstant  = GetItemInfoInstant  or (C_Item and C_Item.GetItemInfoInstant)
+local GetItemSpell        = GetItemSpell        or (C_Item and C_Item.GetItemSpell)
+local GetInventoryItemLink = GetInventoryItemLink or (C_Item and C_Item.GetInventoryItemLink)
+local GetCoinTextureString = GetCoinTextureString or (C_CurrencyInfo and C_CurrencyInfo.GetCoinTextureString)
+local IsSpellKnown        = IsSpellKnown        or (C_SpellBook and C_SpellBook.IsSpellKnown)
+-- Blizzard's own deprecation maps IsPlayerSpell onto the "or overrides" variant.
+local IsPlayerSpell       = IsPlayerSpell       or (C_SpellBook and C_SpellBook.IsSpellKnownOrOverridesKnown)
 local DE_SPELL   = 13262 -- Disenchant
 local ENCH_SPELL = 7411  -- Enchanting (for the skill-line name)
 
@@ -383,7 +397,7 @@ local function beatsEquipped(invType, ilvl, classID, subID)
   if not slots then return nil end
   local worst, worstName -- the slot you'd actually replace: the weakest one
   for _, s in ipairs(slots) do
-    local link = GetInventoryItemLink("player", s)
+    local link = GetInventoryItemLink and GetInventoryItemLink("player", s)
     if link then
       local eName, _, _, eLvl, _, _, _, _, _, _, _, eClass, eSub = GetItemInfo(link)
       -- Armour classes only compare against their own kind (1 cloth .. 4 plate);

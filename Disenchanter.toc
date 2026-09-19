@@ -1,8 +1,8 @@
-## Interface: 20506,11509
+## Interface: 20506,16001,11509
 ## Title: Disenchanter
 ## Notes: Guarded one-click disenchanting — plus a Trash tab for deleting junk when the bags are full.
 ## Author: dlicudi
-## Version: 0.4.1
+## Version: 0.4.2
 ## SavedVariables: DisenchanterDB
 ## X-Category: Professions
 ## OptionalDeps: Auctionator, Pawn, ItemRack, TradeSkillMaster

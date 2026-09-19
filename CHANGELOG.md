@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.2 — 2026-09-19
+
+- **Runs on the 1.60 Classic beta client.** That build finished an API
+  migration the Anniversary and Era clients haven't started: the loose item,
+  spell and money globals now live in `C_Item`, `C_SpellBook` and
+  `C_CurrencyInfo`, and the old globals are gone — so opening the window threw
+  `attempt to call a nil value` on the first `GetItemInfo` of the bag scan.
+  Each one is now resolved once at load to whichever spelling the running
+  client has, leaving every call site written the old way.
+- Two of those were failing quietly rather than loudly: `IsSpellKnown` and
+  `IsPlayerSpell` were already nil-guarded, so on that client the window would
+  have claimed you don't know Disenchant.
+
 ## 0.4.1 — 2026-08-31
 
 - **Fix: a click could equip, sell, mail or trade the item instead of
