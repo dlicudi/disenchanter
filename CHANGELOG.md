@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 — 2026-09-30
+
+- `/de value 0` now genuinely disables the value guard on both tabs.
+- Disenchant rows sort by calculated market or vendor value first.
+- The secure window is built at login; combat-time opening is deferred.
+- Added syntax, upvalue, version-consistency, and smoke tests.
+- Documentation now names all supported clients and secure click behavior.
+
 ## 0.4.2 — 2026-09-19
 
 - **Runs on the 1.60 Classic beta client.** That build finished an API

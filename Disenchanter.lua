@@ -77,6 +77,7 @@
 
 local DE = {}
 Disenchanter = DE -- global, mostly for /dump poking
+local VERSION = "0.5.0"
 
 local C = C_Container
 
@@ -442,7 +443,7 @@ local function verdict(it, skill)
   end
 
   if g.boe and it.boe then return "confirm", "bind-on-equip" end
-  if g.value and it.boe and it.value and it.value >= d.valueGold * 10000 then
+  if g.value and d.valueGold > 0 and it.boe and it.value and it.value >= d.valueGold * 10000 then
     return "confirm", ("worth %s%s"):format(money(it.value), it.valueSrc == "ah" and " on the AH" or " to a vendor")
   end
   if it.quality > d.confirmAbove then
@@ -508,6 +509,8 @@ function DE.Scan()
   -- Cheapest first inside each bucket: you work down a bag of greens from the
   -- top, and the top row is always the one you care least about.
   local function order(a, b)
+    local av, bv = a.value or math.huge, b.value or math.huge
+    if av ~= bv then return av < bv end
     if a.quality ~= b.quality then return a.quality < b.quality end
     if a.ilvl ~= b.ilvl then return a.ilvl < b.ilvl end
     return a.name < b.name
@@ -539,7 +542,7 @@ local function trashVerdict(it)
     -- The value guard bites harder here than on the disenchant tab: deleting
     -- a stack of cloth is pure loss, so a valuable stack is Protected, not
     -- merely Ctrl-gated. Allow drops it to "check first" as usual.
-    if d.guards.value and it.value and it.value >= d.valueGold * 10000 then
+    if d.guards.value and d.valueGold > 0 and it.value and it.value >= d.valueGold * 10000 then
       return "blocked", ("worth %s%s"):format(money(it.value),
         it.valueSrc == "ah" and " on the AH" or " to a vendor")
     end
@@ -821,6 +824,7 @@ local function tipHide() GameTooltip:Hide() end
 -- rebuilds it. You can't disenchant in combat anyway.
 --------------------------------------------------------------------------------
 local win
+local pendingToggle, pendingTab, pendingShow = false, nil, false
 local WIN_W, WIN_H = 380, 460
 local ROW_W  = 320
 local ROW_H  = 30
@@ -1609,8 +1613,24 @@ local function ensureWindow()
 end
 
 function DE.Toggle()
+  if InCombatLockdown() then
+    pendingToggle = not pendingToggle
+    pendingTab, pendingShow = nil, false
+    pr(pendingToggle and "window will toggle when combat ends." or "pending window toggle cancelled.")
+    return
+  end
   local f = ensureWindow()
   if f:IsShown() then f:Hide() else f:Show() end
+end
+
+function DE.ShowTab(tab)
+  if InCombatLockdown() then
+    pendingTab, pendingShow, pendingToggle = tab, true, false
+    pr("tab will open when combat ends.")
+    return
+  end
+  DE.SetTab(tab)
+  win:Show()
 end
 
 function DE.SetTab(tab)
@@ -1812,6 +1832,7 @@ function DE.InitBroker()
   broker = ldb:NewDataObject("Disenchanter", {
     type = "data source",
     label = "Disenchanter",
+    version = VERSION,
     icon = "Interface\\Icons\\Spell_Holy_RemoveCurse",
     text = "…",
     OnClick = function(_, button)
@@ -1881,6 +1902,7 @@ end
 ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
   if event == "PLAYER_LOGIN" then
     db()
+    ensureWindow()
     DE.InitBroker()
     if not knowsDisenchant() then
       -- Still perfectly usable as a "what would this give me" viewer, so this
@@ -1906,7 +1928,18 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
       win.status:SetText(statusText({}, {}, {}))
     end
 
-  elseif event == "PLAYER_REGEN_ENABLED" or event == "GROUP_ROSTER_UPDATE" then
+  elseif event == "PLAYER_REGEN_ENABLED" then
+    if pendingShow and pendingTab then
+      local tab = pendingTab
+      pendingTab, pendingShow = nil, false
+      DE.ShowTab(tab)
+    elseif pendingToggle then
+      pendingToggle = false
+      DE.Toggle()
+    end
+    queueRefresh()
+
+  elseif event == "GROUP_ROSTER_UPDATE" then
     queueRefresh()
 
   elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
@@ -1965,11 +1998,9 @@ function DE.Command(rest)
   if cmd == "" then
     DE.Toggle()
   elseif cmd == "trash" or cmd == "junk" then
-    DE.SetTab("trash") -- runs ensureWindow, so `win` is set after it
-    win:Show()
+    DE.ShowTab("trash")
   elseif cmd == "run" then
-    DE.SetTab("run")
-    win:Show()
+    DE.ShowTab("run")
   elseif cmd == "scan" or cmd == "list" then
     DE.Report()
   elseif cmd == "keep" then
@@ -2040,3 +2071,8 @@ end
 SLASH_DISENCHANTER1 = "/de"
 SLASH_DISENCHANTER2 = "/disenchanter"
 SlashCmdList.DISENCHANTER = function(msg) DE.Command(msg) end
+
+DE._verdict = verdict
+DE._trashVerdict = trashVerdict
+DE._window = function() return win end
+DE._event = function(...) return ev:GetScript("OnEvent")(ev, ...) end

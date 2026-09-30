@@ -1,6 +1,7 @@
 # Disenchanter
 
-Guarded one-click disenchanting for WoW Classic (Anniversary, Interface 20506).
+Guarded one-click disenchanting for WoW Classic Anniversary, Era, and the
+forever Classic beta (Interfaces 20506, 11509, and 16001).
 Companion to [mail-mule](https://github.com/dlicudi/mail-mule) — same shape, same
 "the addon never acts on its own" rule.
 
@@ -65,8 +66,8 @@ which boss is the loot master's call, not arithmetic.
 
 ## Safety
 
-The addon never casts anything. Each row is a Blizzard secure button carrying a
-plain macro:
+The addon never casts automatically. Each row is a Blizzard secure button
+carrying a plain macro that runs only on your click:
 
 ```
 /cast Disenchant
@@ -207,7 +208,8 @@ All soft — the addon works without any of them.
   bands. It's a hint for "is this worth my time", not a promise — the actual roll
   inside a band is dust vs essence vs shard.
 - In combat the list freezes and greys out: arming a row means `SetAttribute`,
-  which Blizzard forbids in combat. You can't disenchant in combat anyway.
+  which Blizzard forbids in combat. Opening or changing tabs is deferred until
+  combat ends, and the secure rows are built safely at login.
 - Without Enchanting the window still works as a "what would this give me"
   viewer; nothing will cast.
 
