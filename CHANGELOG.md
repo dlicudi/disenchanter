@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Reworked the window into a compact, resizable meter-style panel shared with
+  Summon: slim title bar, state-tinted rows, tighter chrome, and remembered size
+  and position. Item rows remain tall enough for explicit safety guidance.
+- Added a compatibility module for modern and legacy container APIs.
+- Repairs malformed saved-variable fields instead of failing during a scan.
+- Trash deletion now verifies that the original stack disappeared before it is
+  reported or written to the audit.
+- Audit attribution accepts only known or API-classified enchanting materials,
+  preventing unrelated personal loot from polluting run splits.
+- Expanded automated coverage for compatibility, guards, secure click gates,
+  saved data, loot attribution, and deletion, plus a real-client release checklist.
+
 ## 0.5.0 — 2026-09-30
 
 - `/de value 0` now genuinely disables the value guard on both tabs.

@@ -5,6 +5,6 @@
   "description": "WoW Classic guarded one-click disenchanting addon",
   "scripts": {
     "sync-addon": "./sync.sh",
-    "test": "./test/version.sh && luac -p Disenchanter.lua && ./test/upvalues.sh Disenchanter.lua && lua test/smoke.lua Disenchanter.lua"
+    "test": "./test/version.sh && luac -p Disenchanter_Compat.lua && luac -p Disenchanter.lua && ./test/upvalues.sh Disenchanter.lua && lua test/compat.lua Disenchanter_Compat.lua && lua test/smoke.lua Disenchanter_Compat.lua Disenchanter.lua"
   }
 }

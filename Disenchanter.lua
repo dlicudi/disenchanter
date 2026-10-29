@@ -79,7 +79,8 @@ local DE = {}
 Disenchanter = DE -- global, mostly for /dump poking
 local VERSION = "0.5.0"
 
-local C = C_Container
+local C = assert(DisenchanterCompat and DisenchanterCompat.Container,
+  "Disenchanter: compatibility module did not load")
 
 --- The 1.60 Classic client finished a migration the older builds hadn't started:
 --- the loose item/spell/money globals now live in C_Item, C_SpellBook and
@@ -268,23 +269,43 @@ local GUARDS = {
 }
 
 local function db()
-  DisenchanterDB = DisenchanterDB or {}
+  if type(DisenchanterDB) ~= "table" then DisenchanterDB = {} end
   local d = DisenchanterDB
-  d.keep = d.keep or {}
-  d.keep.items = d.keep.items or {}
-  d.keep.names = d.keep.names or {}
-  d.learned = d.learned or {}
-  d.audit = d.audit or {}
-  d.collapsed = d.collapsed or {}
-  if d.confirmAbove == nil then d.confirmAbove = 2 end
-  if d.valueGold == nil then d.valueGold = 10 end
-  if d.ilvlCap == nil then d.ilvlCap = 0 end
+  if type(d.keep) ~= "table" then d.keep = {} end
+  if type(d.keep.items) ~= "table" then d.keep.items = {} end
+  if type(d.keep.names) ~= "table" then d.keep.names = {} end
+  if type(d.learned) ~= "table" then d.learned = {} end
+  if type(d.audit) ~= "table" then d.audit = {} end
+  if type(d.collapsed) ~= "table" then d.collapsed = {} end
+  if type(d.panel) ~= "table" then d.panel = {} end
+  d.confirmAbove = tonumber(d.confirmAbove) or 2
+  if d.confirmAbove < 2 or d.confirmAbove > 4 then d.confirmAbove = 2 end
+  d.valueGold = math.max(0, tonumber(d.valueGold) or 10)
+  d.ilvlCap = math.max(0, tonumber(d.ilvlCap) or 0)
   -- "spell" was a stopgap while the dead-click was being tracked down; the real
   -- cause was click registration, so put everyone back on the macro path once.
   if d.clickModeVersion ~= 2 then d.clickMode, d.clickModeVersion = "macro", 2 end
-  if d.guards == nil then
+  if type(d.guards) ~= "table" then
     d.guards = {}
-    for _, g in ipairs(GUARDS) do d.guards[g.key] = (g.key ~= "boe") end
+  end
+  for _, g in ipairs(GUARDS) do
+    if type(d.guards[g.key]) ~= "boolean" then d.guards[g.key] = (g.key ~= "boe") end
+  end
+  -- Drop malformed entries rather than letting an old or hand-edited saved
+  -- variable break every scan. Valid historical audit rows are retained.
+  for id, kept in pairs(d.keep.items) do
+    if type(id) ~= "number" or kept ~= true then d.keep.items[id] = nil end
+  end
+  for i = #d.keep.names, 1, -1 do
+    if type(d.keep.names[i]) ~= "string" then table.remove(d.keep.names, i) end
+  end
+  for id, learned in pairs(d.learned) do
+    if type(id) ~= "number" or learned ~= true then d.learned[id] = nil end
+  end
+  for i = #d.audit, 1, -1 do
+    local e = d.audit[i]
+    if type(e) ~= "table" or type(e.t) ~= "number" or type(e.out) ~= "string"
+        or type(e.n) ~= "number" or e.n < 1 then table.remove(d.audit, i) end
   end
   return d
 end
@@ -299,8 +320,6 @@ local allowed = {}
 --------------------------------------------------------------------------------
 local function money(copper) return GetCoinTextureString(copper or 0) end
 
---- C_Container is a backport; fall back to the old global if this build predates
---- the container API gaining UseContainerItem.
 --- Your Enchanting rank, or nil if we can't see it (collapsed skill headers).
 local function enchantingSkill()
   local want = spellName(ENCH_SPELL, "Enchanting")
@@ -633,6 +652,19 @@ local lastDESource -- link of the item the completed cast consumed
 local sessionStart = time() -- fallback split marker: since login
 local AUDIT_MAX = 300
 
+-- Disenchant outputs on the supported Era/TBC-family clients. Restricting the
+-- audit to these ids prevents an unrelated personal loot line in the short
+-- attribution window from becoming part of the shard split.
+local ENCHANT_MATERIAL = {
+  [10938]=true, [10939]=true, [10940]=true, [10998]=true,
+  [11082]=true, [11083]=true, [11084]=true,
+  [11134]=true, [11135]=true, [11137]=true, [11138]=true, [11139]=true,
+  [11174]=true, [11175]=true, [11176]=true, [11177]=true, [11178]=true,
+  [14343]=true, [14344]=true, [16202]=true, [16203]=true, [16204]=true,
+  [20725]=true, [22445]=true, [22446]=true, [22447]=true, [22448]=true,
+  [22449]=true, [22450]=true,
+}
+
 -- "You receive loot: %s." and friends, turned into literal prefixes. If none
 -- of the globals exist on this client, the filter stands down (old behavior).
 local SELF_LOOT_PREFIX = {}
@@ -670,9 +702,63 @@ local function noteLoot(msg)
   if not isSelfLoot(msg) then return end
   local link, count = msg:match("(|c%x+|Hitem:.-|h.-|h|r)%s*x?(%d*)")
   if not link then return end
+  local itemID = tonumber(link:match("|Hitem:(%d+)"))
+  local isMaterial = itemID and ENCHANT_MATERIAL[itemID]
+  -- Future Classic branches may introduce new enchanting reagents. Preserve
+  -- those without reopening attribution to arbitrary personal loot: WoW's
+  -- numeric class/subclass for Enchanting trade goods is 7/12.
+  if not isMaterial and GetItemInfoInstant then
+    local ok, _, _, _, _, _, classID, subID = pcall(GetItemInfoInstant, link)
+    isMaterial = ok and classID == 7 and subID == 12
+  end
+  if not isMaterial then return end
   local n = tonumber(count) or 1
   DE.tally[link] = (DE.tally[link] or 0) + n
   auditAppend(lastDESource, link, n)
+end
+
+local pendingTrash
+
+local function recordTrashDeletion(it)
+  auditAppend(it.link, "deleted", it.count, true)
+  pr(("deleted %s%s%s."):format(it.link,
+    it.count > 1 and (" x" .. it.count) or "",
+    it.vendor and it.vendor > 0 and (" — worth " .. money(it.vendor) .. " to a vendor") or ""))
+end
+
+local function finishPendingTrash()
+  local p = pendingTrash
+  if not p then return end
+  local now = C.GetContainerItemInfo(p.bag, p.slot)
+  if now and now.itemID == p.it.itemID and (now.stackCount or 1) == p.it.count then return end
+  pendingTrash = nil
+  recordTrashDeletion(p.it)
+end
+
+local function deleteTrash(it, bag, slot)
+  local now = C.GetContainerItemInfo(bag, slot)
+  if not (now and now.itemID == it.itemID and (now.stackCount or 1) == it.count) then
+    return false, "the bag slot changed"
+  end
+  ClearCursor()
+  if not C.PickupContainerItem(bag, slot) then return false, "item pickup is unavailable" end
+  if CursorHasItem and not CursorHasItem() then return false, "the item was not picked up" end
+  if not DeleteCursorItem then ClearCursor(); return false, "deletion is unavailable" end
+  pendingTrash = { it = it, bag = bag, slot = slot }
+  DeleteCursorItem()
+
+  -- Greys normally settle synchronously. Whites may open Blizzard's deletion
+  -- confirmation; in that case BAG_UPDATE completes the audit only after the
+  -- player accepts. A cancelled dialog therefore produces no success record.
+  local after = C.GetContainerItemInfo(bag, slot)
+  if not (after and after.itemID == it.itemID and (after.stackCount or 1) == it.count) then
+    pendingTrash = nil
+    auditAppend(it.link, "deleted", it.count, true)
+    return true
+  end
+  local token = pendingTrash
+  C_Timer.After(30, function() if pendingTrash == token then pendingTrash = nil end end)
+  return nil, "waiting for the client confirmation"
 end
 
 function DE.Tally()
@@ -794,7 +880,9 @@ function DE.Split(args)
 end
 
 --------------------------------------------------------------------------------
--- Chrome, borrowed wholesale from Mail Mule so the two addons look related.
+-- Compact meter-style chrome shared with Summon. Disenchanter keeps taller
+-- rows because its actions are destructive and each item needs a second line
+-- for its yield or the reason it was held back.
 --------------------------------------------------------------------------------
 local FALLBACK_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 local PLUS   = "Interface\\Buttons\\UI-PlusButton-Up"
@@ -825,11 +913,20 @@ local function tipHide() GameTooltip:Hide() end
 --------------------------------------------------------------------------------
 local win
 local pendingToggle, pendingTab, pendingShow = false, nil, false
-local WIN_W, WIN_H = 380, 460
-local ROW_W  = 320
+local WIN_W, WIN_H = 380, 430
+local MIN_W, MIN_H = 340, 420 -- tall enough for the fixed options drawer
+local MAX_W, MAX_H = 620, 760
+local ROW_W  = 342 -- initial width; resized rows are anchored to both edges
 local ROW_H  = 30
-local HEAD_H = 22
-local LIST_H = 300
+local HEAD_H = 20
+
+local function rowWidth()
+  if win and win.content and win.content.GetWidth then
+    local w = win.content:GetWidth()
+    if type(w) == "number" and w > 1 then return w end
+  end
+  return ROW_W
+end
 
 local BUCKETS = {
   { key = "safe",    title = "Safe to disenchant",  color = "|cff33cc44" },
@@ -925,7 +1022,11 @@ local function headerRow(i)
   local row = win.heads[i]
   if row then return row end
   row = CreateFrame("Button", nil, win.content)
-  row:SetSize(ROW_W, HEAD_H)
+  row:SetHeight(HEAD_H)
+  row:SetPoint("RIGHT", win.content, "RIGHT", 0, 0)
+  row.bg = row:CreateTexture(nil, "BACKGROUND")
+  row.bg:SetAllPoints()
+  row.bg:SetColorTexture(0.22, 0.16, 0.30, 0.55)
   row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
   row.toggle = row:CreateTexture(nil, "ARTWORK")
   row.toggle:SetSize(14, 14)
@@ -945,13 +1046,17 @@ local function itemRow(i)
   local row = win.rows[i]
   if row then return row end
   row = CreateFrame("Button", "DisenchanterRow" .. i, win.content, "SecureActionButtonTemplate")
-  row:SetSize(ROW_W, ROW_H)
+  row:SetHeight(ROW_H)
+  row:SetPoint("RIGHT", win.content, "RIGHT", 0, 0)
   -- Both edges, not just "LeftButtonUp". This client's secure handler acts on
   -- whichever edge ActionButtonUseKeyDown selects and returns silently on the
   -- other, so registering one edge can leave the button doing nothing at all.
   -- Every working secure button ships this way (Leatrix_Plus, Broker_Everything).
   row:RegisterForClicks("AnyUp", "AnyDown")
   row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+
+  row.bg = row:CreateTexture(nil, "BACKGROUND")
+  row.bg:SetAllPoints()
 
   -- The in-row cast bar: a translucent fill that sweeps across the row while
   -- your Disenchant is casting on its item. BACKGROUND layer, so the icon and
@@ -1095,16 +1200,15 @@ local function itemRow(i)
       local it = self.item
       if down or button ~= "LeftButton" or not (it and it.trash) then return end
       if it.tier ~= "safe" and not IsControlKeyDown() then return end
-      local now = C.GetContainerItemInfo(self.trashBag, self.trashSlot)
-      if not (now and now.itemID == it.itemID) then return end
-      ClearCursor() -- drop anything already held back into its slot first
-      if C and C.PickupContainerItem then C.PickupContainerItem(self.trashBag, self.trashSlot)
-      elseif PickupContainerItem then PickupContainerItem(self.trashBag, self.trashSlot)
-      else return end
-      if CursorHasItem and not CursorHasItem() then return end
-      if not DeleteCursorItem then ClearCursor() return end
-      DeleteCursorItem()
-      auditAppend(it.link, "deleted", it.count, true)
+      local ok, why = deleteTrash(it, self.trashBag, self.trashSlot)
+      if ok == false then
+        pr(("did not delete %s — %s. Rescan and try again."):format(it.link, why))
+        return
+      end
+      if ok == nil then
+        pr(("confirm deletion of %s in the client dialog."):format(it.link))
+        return
+      end
       pr(("deleted %s%s%s."):format(it.link,
         it.count > 1 and (" x" .. it.count) or "",
         it.vendor > 0 and (" — worth " .. money(it.vendor) .. " to a vendor") or ""))
@@ -1148,6 +1252,12 @@ end
 
 function DE.Refresh()
   if not (win and win:IsShown()) then return end
+  if win.tab == "options" then
+    DE.RefreshOptions()
+    win.status:SetText("Options")
+    win.hint:SetText("Choose what is protected and what requires confirmation.")
+    return
+  end
   if InCombatLockdown() then
     win.content:SetAlpha(0.35) -- visibly frozen; SetAlpha is fine in lockdown
     win.status:SetText(statusText({}, {}, {}))
@@ -1182,7 +1292,9 @@ function DE.Refresh()
     head.key = ck
     head.toggle:SetTexture(isCollapsed(ck) and PLUS or MINUS)
     head.text:SetText(("%s%s|r  |cff888888(%d)|r"):format(b.color, b.title, #list))
-    head:ClearAllPoints(); head:SetPoint("TOPLEFT", 0, y)
+    head:ClearAllPoints()
+    head:SetPoint("TOPLEFT", 0, y)
+    head:SetPoint("TOPRIGHT", 0, y)
     head:Show()
     y = y - HEAD_H
 
@@ -1191,6 +1303,13 @@ function DE.Refresh()
         ri = ri + 1
         local row = itemRow(ri)
         row.item = it
+        if it.tier == "safe" then
+          row.bg:SetColorTexture(0.20, 0.65, 0.28, ri % 2 == 0 and 0.10 or 0.06)
+        elseif it.tier == "confirm" then
+          row.bg:SetColorTexture(1, 0.72, 0, ri % 2 == 0 and 0.14 or 0.09)
+        else
+          row.bg:SetColorTexture(0.85, 0.22, 0.22, ri % 2 == 0 and 0.11 or 0.07)
+        end
         row.icon:SetTexture(it.icon or FALLBACK_ICON)
         row.icon:SetDesaturated(it.tier == "blocked")
         if trash then
@@ -1229,7 +1348,9 @@ function DE.Refresh()
           -- click could only produce an error mid-cast.
           arm(row, (it.casting or not canCast) and "blocked" or it.tier, it.bag, it.slot)
         end
-        row:ClearAllPoints(); row:SetPoint("TOPLEFT", 0, y)
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", 0, y)
+        row:SetPoint("TOPRIGHT", 0, y)
         row:Show()
         y = y - ROW_H
       end
@@ -1282,7 +1403,9 @@ function DE.RefreshRun()
     h.key = key
     h.toggle:SetTexture(isCollapsed(key) and PLUS or MINUS)
     h.text:SetText(text)
-    h:ClearAllPoints(); h:SetPoint("TOPLEFT", 0, y)
+    h:ClearAllPoints()
+    h:SetPoint("TOPLEFT", 0, y)
+    h:SetPoint("TOPRIGHT", 0, y)
     h:Show()
     y = y - HEAD_H
   end
@@ -1290,6 +1413,7 @@ function DE.RefreshRun()
     ri = ri + 1
     local row = itemRow(ri)
     row.item = { run = true, runLink = link }
+    row.bg:SetColorTexture(1, 1, 1, ri % 2 == 0 and 0.055 or 0.025)
     row.icon:SetTexture(iconOf(link) or FALLBACK_ICON)
     row.icon:SetDesaturated(false)
     row.name:SetText(nameText)
@@ -1298,7 +1422,9 @@ function DE.RefreshRun()
     row.lock:Hide()
     row.allow:Hide()
     arm(row, "blocked")
-    row:ClearAllPoints(); row:SetPoint("TOPLEFT", 0, y)
+    row:ClearAllPoints()
+    row:SetPoint("TOPLEFT", 0, y)
+    row:SetPoint("TOPRIGHT", 0, y)
     row:Show()
     y = y - ROW_H
   end
@@ -1362,14 +1488,13 @@ function DE.RefreshRun()
 end
 
 --------------------------------------------------------------------------------
--- Options drawer: the guard toggles and the three thresholds, folded away by
--- default because you set them once and forget them.
+-- Options tab: the guard toggles and the three thresholds.
 --------------------------------------------------------------------------------
 local function ensureOptions(parent)
   local o = CreateFrame("Frame", nil, parent, BackdropTemplateMixin and "BackdropTemplate" or nil)
-  o:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, -82)
-  o:SetSize(WIN_W - 24, LIST_H)
-  backdrop(o, 0.85)
+  o:SetPoint("TOPLEFT", parent, "TOPLEFT", 5, -74)
+  o:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -5, 34)
+  backdrop(o, 0.96)
   o:EnableMouse(true)
   o:Hide()
   o.checks = {}
@@ -1421,8 +1546,9 @@ local function ensureOptions(parent)
     function(v) db().ilvlCap = math.max(0, v) end)
 
   o.quality = CreateFrame("Button", nil, o, "UIPanelButtonTemplate")
-  o.quality:SetSize(WIN_W - 48, 22)
   o.quality:SetPoint("TOPLEFT", 12, y - 4)
+  o.quality:SetPoint("RIGHT", -12, 0)
+  o.quality:SetHeight(22)
   o.quality:SetScript("OnClick", function()
     local d = db()
     d.confirmAbove = (d.confirmAbove >= 4) and 2 or (d.confirmAbove + 1)
@@ -1460,72 +1586,119 @@ local function ensureWindow()
   if win then return win end
   local f = CreateFrame("Frame", "DisenchanterFrame", UIParent,
     BackdropTemplateMixin and "BackdropTemplate" or nil)
-  f:SetSize(WIN_W, WIN_H)
-  f:SetPoint("CENTER", 0, 60)
+  f:SetSize(math.max(MIN_W, math.min(MAX_W, db().panel.w or WIN_W)),
+    math.max(MIN_H, math.min(MAX_H, db().panel.h or WIN_H)))
+  if db().panel.point then
+    f:SetPoint(db().panel.point, UIParent, db().panel.relativePoint or db().panel.point,
+      db().panel.x or 0, db().panel.y or 0)
+  else
+    f:SetPoint("CENTER", 0, 60)
+  end
   f:SetBackdrop({
-    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
-    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-    tile = true, tileSize = 32, edgeSize = 32,
-    insets = { left = 8, right = 8, top = 8, bottom = 8 },
+    bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 8,
+    insets = { left = 2, right = 2, top = 2, bottom = 2 },
   })
+  f:SetBackdropColor(0.08, 0.08, 0.08, 0.94)
+  f:SetBackdropBorderColor(0.28, 0.24, 0.34, 1)
   f:SetMovable(true)
+  f:SetResizable(true)
+  if f.SetResizeBounds then f:SetResizeBounds(MIN_W, MIN_H, MAX_W, MAX_H)
+  elseif f.SetMinResize then f:SetMinResize(MIN_W, MIN_H); f:SetMaxResize(MAX_W, MAX_H) end
   f:EnableMouse(true)
   f:SetClampedToScreen(true)
   f:RegisterForDrag("LeftButton")
   f:SetScript("OnDragStart", f.StartMoving)
-  f:SetScript("OnDragStop", f.StopMovingOrSizing)
+  f:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+    local point, _, relativePoint, x, y = self:GetPoint()
+    db().panel.point, db().panel.relativePoint = point, relativePoint
+    db().panel.x, db().panel.y = x, y
+  end)
   f:SetFrameStrata("DIALOG")
   f:SetScript("OnShow", function() DE.Refresh() end)
   tinsert(UISpecialFrames, "DisenchanterFrame") -- Esc closes it
 
-  local header = f:CreateTexture(nil, "ARTWORK")
-  header:SetTexture("Interface\\DialogFrame\\UI-DialogBox-Header")
-  header:SetSize(240, 60)
-  header:SetPoint("TOP", 0, 12)
+  local header = f:CreateTexture(nil, "BORDER")
+  header:SetPoint("TOPLEFT", 1, -1)
+  header:SetPoint("TOPRIGHT", -1, -1)
+  header:SetHeight(18)
+  header:SetColorTexture(0.22, 0.16, 0.30, 0.98)
   local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  title:SetPoint("TOP", header, "TOP", 0, -13)
+  title:SetPoint("TOPLEFT", 6, -4)
   title:SetText("Disenchanter")
-  local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
-  close:SetPoint("TOPRIGHT", -4, -4)
+  local close = CreateFrame("Button", nil, f)
+  close:SetSize(14, 14)
+  close:SetPoint("TOPRIGHT", -3, -3)
+  local closeText = close:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  closeText:SetAllPoints(); closeText:SetText("x")
+  close:SetScript("OnClick", function() f:Hide() end)
 
   win = f
   win.rows, win.heads = {}, {}
 
   win.status = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  win.status:SetPoint("TOPLEFT", 16, -30)
-  win.status:SetPoint("TOPRIGHT", -16, -30)
+  win.status:SetPoint("TOPLEFT", 7, -23)
+  win.status:SetPoint("TOPRIGHT", -7, -23)
   win.status:SetJustifyH("LEFT")
 
   win.hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  win.hint:SetPoint("TOPLEFT", 16, -46)
-  win.hint:SetPoint("TOPRIGHT", -16, -46)
+  win.hint:SetPoint("TOPLEFT", 7, -39)
+  win.hint:SetPoint("TOPRIGHT", -7, -39)
   win.hint:SetJustifyH("LEFT")
   win.hint:SetWordWrap(false) -- a long hint truncates rather than spill into the tabs
   win.hint:SetText("Click a green row to disenchant it \226\128\148 Ctrl-click an amber one.")
 
-  -- The two tabs. The active one is disabled: the greyed art reads as
-  -- pressed-in, and a highlight font keeps its label legible.
-  local function tabButton(label, w, tab)
-    local b = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    b:SetSize(w, 20)
-    b:SetText(label)
-    b:SetDisabledFontObject(GameFontHighlightSmall)
+  -- Draw tabs locally instead of inheriting a FrameXML tab template: the
+  -- available template names differ between Classic client branches.
+  local function tabButton(id, label, w, tab)
+    local b = CreateFrame("Button", "DisenchanterFrameTab" .. id, f)
+    b:SetID(id)
+    b:SetSize(w, 24)
+    b.bg = b:CreateTexture(nil, "BACKGROUND")
+    b.bg:SetPoint("TOPLEFT", 1, -1)
+    b.bg:SetPoint("BOTTOMRIGHT", -1, 0)
+    b.bg:SetColorTexture(0.10, 0.08, 0.12, 0.96)
+    b.edge = b:CreateTexture(nil, "BORDER")
+    b.edge:SetPoint("BOTTOMLEFT", 1, 0)
+    b.edge:SetPoint("BOTTOMRIGHT", -1, 0)
+    b.edge:SetHeight(2)
+    b.edge:SetColorTexture(0.50, 0.42, 0.58, 0.9)
+    b.text = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    b.text:SetPoint("CENTER", 0, 1)
+    b.text:SetText(label)
+    b:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
     b:SetScript("OnClick", function() DE.SetTab(tab) end)
     return b
   end
   win.tab = "de"
-  win.tabDE = tabButton("Disenchant", 90, "de")
-  win.tabDE:SetPoint("TOPLEFT", 12, -60)
-  win.tabDE:Disable()
-  win.tabTrash = tabButton("Trash", 60, "trash")
-  win.tabTrash:SetPoint("LEFT", win.tabDE, "RIGHT", 4, 0)
-  win.tabRun = tabButton("Run", 50, "run")
-  win.tabRun:SetPoint("LEFT", win.tabTrash, "RIGHT", 4, 0)
+  win.tabDE = tabButton(1, "Disenchant", 100, "de")
+  win.tabDE:SetPoint("TOPLEFT", 5, -53)
+  win.tabTrash = tabButton(2, "Trash", 70, "trash")
+  win.tabTrash:SetPoint("LEFT", win.tabDE, "RIGHT", -8, 0)
+  win.tabRun = tabButton(3, "Run", 60, "run")
+  win.tabRun:SetPoint("LEFT", win.tabTrash, "RIGHT", -8, 0)
+  win.tabOptions = tabButton(4, "Options", 78, "options")
+  win.tabOptions:SetPoint("LEFT", win.tabRun, "RIGHT", -8, 0)
+  function win:SelectTabChrome(tabID)
+    for id, button in ipairs({ self.tabDE, self.tabTrash, self.tabRun, self.tabOptions }) do
+      local selected = id == tabID
+      button:SetEnabled(not selected)
+      button.bg:SetColorTexture(selected and 0.22 or 0.10,
+        selected and 0.16 or 0.08, selected and 0.30 or 0.12, 0.96)
+      button.edge:SetColorTexture(selected and 1 or 0.50,
+        selected and 0.82 or 0.42, selected and 0 or 0.58, selected and 1 or 0.9)
+      button.text:SetTextColor(selected and 1 or 0.80,
+        selected and 0.82 or 0.80, selected and 0 or 0.80)
+    end
+  end
+  win:SelectTabChrome(1)
 
   local inset = CreateFrame("Frame", nil, f, BackdropTemplateMixin and "BackdropTemplate" or nil)
-  inset:SetPoint("TOPLEFT", 12, -82)
-  inset:SetSize(WIN_W - 24, LIST_H)
-  backdrop(inset)
+  inset:SetPoint("TOPLEFT", 5, -74)
+  inset:SetPoint("BOTTOMRIGHT", -5, 34)
+  backdrop(inset, 0.55)
   local scroll = CreateFrame("ScrollFrame", "DisenchanterScroll", inset, "UIPanelScrollFrameTemplate")
   scroll:SetPoint("TOPLEFT", 5, -5)
   scroll:SetPoint("BOTTOMRIGHT", -27, 5)
@@ -1537,7 +1710,7 @@ local function ensureWindow()
   win.empty:SetPoint("CENTER")
   win.empty:SetText("Nothing disenchantable in your bags")
 
-  -- The options drawer sits over the list, so it has to win on frame level.
+  -- The options tab sits over the list, so it has to win on frame level.
   win.opts = ensureOptions(f)
   win.opts:SetFrameLevel(inset:GetFrameLevel() + 20)
 
@@ -1548,29 +1721,17 @@ local function ensureWindow()
     return b
   end
   local rescan = mk("Rescan", 80)
-  rescan:SetPoint("BOTTOMLEFT", 14, 14)
+  rescan:SetPoint("BOTTOMLEFT", 6, 6)
   rescan:SetScript("OnClick", function() questCache = {}; DE.Refresh() end)
 
-  local optBtn = mk("Options", 80)
-  optBtn:SetPoint("LEFT", rescan, "RIGHT", 6, 0)
-  optBtn:SetScript("OnClick", function()
-    if win.opts:IsShown() then
-      win.opts:Hide()
-      DE.Refresh()
-    else
-      DE.RefreshOptions()
-      win.opts:Show()
-    end
-  end)
-
   local report = mk("To chat", 80)
-  report:SetPoint("BOTTOMRIGHT", -14, 14)
+  report:SetPoint("BOTTOMRIGHT", -20, 6)
   report:SetScript("OnClick", function() DE.Report() end)
-  win.rescan, win.optBtn, win.report = rescan, optBtn, report
+  win.rescan, win.report = rescan, report
 
-  -- The Run tab's bottom row, swapped in for Rescan/Options/To chat by SetTab.
+  -- The Run tab's bottom row, swapped in for Rescan/To chat by SetTab.
   local newRun = mk("New run", 80)
-  newRun:SetPoint("BOTTOMLEFT", 14, 14)
+  newRun:SetPoint("BOTTOMLEFT", 6, 6)
   newRun:SetScript("OnClick", function()
     db().splitStart = time()
     pr("run marker set — the Run tab and /de split now count from this moment.")
@@ -1598,12 +1759,28 @@ local function ensureWindow()
   announce:Hide()
   win.newRun, win.announce = newRun, announce
 
+  -- Resize grip and responsive rows, following Summon's compact panel. The
+  -- secure actions do not change here; only the visible geometry does.
+  local grip = CreateFrame("Button", nil, f)
+  grip:SetSize(14, 14)
+  grip:SetPoint("BOTTOMRIGHT", 0, 0)
+  grip:SetFrameLevel(f:GetFrameLevel() + 20)
+  grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+  grip:SetScript("OnMouseDown", function() f:StartSizing("BOTTOMRIGHT") end)
+  grip:SetScript("OnMouseUp", function()
+    f:StopMovingOrSizing()
+    db().panel.w, db().panel.h = math.floor(f:GetWidth() + 0.5), math.floor(f:GetHeight() + 0.5)
+  end)
+  local function resizeContent(self) content:SetWidth(math.max(1, self:GetWidth() - 42)) end
+  f:SetScript("OnSizeChanged", resizeContent)
+  resizeContent(f)
+
   -- Sweeps the casting row's fill each frame; a no-op the rest of the time.
   f:SetScript("OnUpdate", function()
     local row, c = win.castingRow, DE.cast
     if not (row and c and row:IsShown()) then return end
     local prog = math.min((GetTime() - c.startTime) / (c.duration > 0 and c.duration or 1), 1)
-    row.castFill:SetWidth(math.max(prog * ROW_W, 0.01))
+    row.castFill:SetWidth(math.max(prog * rowWidth(), 0.01))
   end)
 
   -- CreateFrame hands back a *shown* frame, so without this the first /de would
@@ -1636,16 +1813,15 @@ end
 function DE.SetTab(tab)
   local f = ensureWindow()
   f.tab = tab
-  f.tabDE:SetEnabled(tab ~= "de")
-  f.tabTrash:SetEnabled(tab ~= "trash")
-  f.tabRun:SetEnabled(tab ~= "run")
+  local tabID = tab == "trash" and 2 or tab == "run" and 3 or tab == "options" and 4 or 1
+  f:SelectTabChrome(tabID)
   local run = tab == "run"
-  f.rescan:SetShown(not run)
-  f.optBtn:SetShown(not run)
-  f.report:SetShown(not run)
+  local options = tab == "options"
+  f.rescan:SetShown(not run and not options)
+  f.report:SetShown(not run and not options)
   f.newRun:SetShown(run)
   f.announce:SetShown(run)
-  if run and f.opts:IsShown() then f.opts:Hide() end
+  f.opts:SetShown(options)
   DE.Refresh()
 end
 
@@ -1911,6 +2087,7 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     end
 
   elseif event == "BAG_UPDATE" then
+    finishPendingTrash()
     -- Disarm immediately: between an item moving and the rebuild landing, a
     -- stale row would point at whatever is now in that slot.
     disarmAll()
@@ -2074,5 +2251,10 @@ SlashCmdList.DISENCHANTER = function(msg) DE.Command(msg) end
 
 DE._verdict = verdict
 DE._trashVerdict = trashVerdict
+DE._db = db
+DE._noteLoot = noteLoot
+DE._deleteTrash = deleteTrash
+DE._finishPendingTrash = finishPendingTrash
+DE._arm = arm
 DE._window = function() return win end
 DE._event = function(...) return ev:GetScript("OnEvent")(ev, ...) end

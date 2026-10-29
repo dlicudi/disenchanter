@@ -17,6 +17,10 @@ three buckets:
 Rows are sorted cheapest-first inside each bucket, so working through a bag of
 greens is: click the top row, wait for the cast, click the new top row.
 
+The compact panel can be moved and resized from its bottom-right grip; its size
+and position are remembered. Rows keep their larger two-line targets so the
+yield or safety reason stays visible even in the denser layout.
+
 Each row shows what it's likely to turn into (`Arcane Dust / Greater Planar
 Essence / Small Prismatic Shard`) or, if it's held back, why.
 
@@ -218,3 +222,35 @@ All soft — the addon works without any of them.
 ```
 npm run sync-addon    # or: ./sync.sh — copies into the WoW AddOns dir, then /reload in game
 ```
+
+## Development and release checks
+
+`Disenchanter_Compat.lua` normalizes container APIs across supported clients;
+`Disenchanter.lua` contains the classification, audit, commands, and UI. Keeping
+the client-version shims separate prevents compatibility branches from leaking
+into the secure and destructive paths.
+
+Run the automated checks before packaging:
+
+```
+npm test
+```
+
+The tests cover syntax and version consistency, legacy/modern container APIs,
+saved-variable repair, guard precedence, value and quality gates, secure
+plain/Ctrl attribute separation, loot filtering, combat deferral, and verified
+Trash deletion. Blizzard's secure execution and lockdown cannot be simulated
+outside the game, so each release also needs this short client checklist on
+every supported branch:
+
+1. Open `/de` before and during combat; confirm combat opening is deferred and
+   rows work again after combat.
+2. Move or split a listed stack; confirm the old row disarms and cannot target
+   the item now occupying that slot.
+3. Disenchant one Safe and one Check first item; confirm plain click only works
+   for Safe and Ctrl-click is required for Check first.
+4. On Trash, delete one grey and one Ctrl-gated white; confirm the audit records
+   them only after they disappear. Cancel any client deletion prompt and confirm
+   no success line or audit row is produced.
+5. Complete a disenchant, then loot an unrelated item immediately; confirm only
+   enchanting materials appear in `/de tally`, `/de audit`, and the Run tab.

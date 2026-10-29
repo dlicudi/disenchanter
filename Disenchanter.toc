@@ -7,4 +7,5 @@
 ## X-Category: Professions
 ## OptionalDeps: Auctionator, Pawn, ItemRack, TradeSkillMaster
 
+Disenchanter_Compat.lua
 Disenchanter.lua

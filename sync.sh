@@ -5,6 +5,6 @@ set -e
 for FLAVOR in _anniversary_ _classic_era_ _classic_beta_; do
   DEST="/Applications/World of Warcraft/$FLAVOR/Interface/AddOns/Disenchanter"
   mkdir -p "$DEST"
-  cp Disenchanter.toc Disenchanter.lua "$DEST/"
+  cp Disenchanter.toc Disenchanter_Compat.lua Disenchanter.lua "$DEST/"
   echo "synced to $DEST"
 done
