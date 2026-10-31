@@ -34,7 +34,9 @@
        ilvlCap      = 0,   -- 0 = off; above this needs a Ctrl-click
        learned = { [12345] = true },  -- server told us these can't be DE'd
        audit = { { t, zone, src, out, n, grp }, ... },  -- newest last, capped
+       runs = { { name, start, finish, totals, members }, ... }, -- capped at 20
        splitStart = 1755400000,       -- /de split start marker (epoch)
+       schemaVersion = 1,
        collapsed = { safe = false, confirm = false, blocked = false },
      }
 
@@ -71,13 +73,16 @@
      /de tally                what you've disenchanted this session
      /de audit [n|clear]      the log: what → what, when, where, group size
      /de split [start|say|party|raid]  divide shards since the marker
+     /de runs [name <text>|end|clear]  archived run summaries
+     /de profit              toggle estimated-profit sorting
      /de mode                 swap macro / spell click plumbing (see README)
      /de debug                dump click state and toggle per-click tracing
 ]]
 
 local DE = {}
 Disenchanter = DE -- global, mostly for /dump poking
-local VERSION = "0.5.0"
+local VERSION = "0.6.0"
+local DB_SCHEMA = 1
 
 local C = assert(DisenchanterCompat and DisenchanterCompat.Container,
   "Disenchanter: compatibility module did not load")
@@ -271,17 +276,28 @@ local GUARDS = {
 local function db()
   if type(DisenchanterDB) ~= "table" then DisenchanterDB = {} end
   local d = DisenchanterDB
+  -- Sequential schema migrations belong here. Repair below remains defensive
+  -- for hand-edited or partially-written SavedVariables, while the version
+  -- makes intentional format changes explicit and testable.
+  local schema = tonumber(d.schemaVersion) or 0
+  if schema < 1 then
+    -- Version 1 records the normalized shape introduced with the compact UI.
+    -- No keys need renaming; existing data is repaired below before stamping.
+    schema = 1
+  end
   if type(d.keep) ~= "table" then d.keep = {} end
   if type(d.keep.items) ~= "table" then d.keep.items = {} end
   if type(d.keep.names) ~= "table" then d.keep.names = {} end
   if type(d.learned) ~= "table" then d.learned = {} end
   if type(d.audit) ~= "table" then d.audit = {} end
+  if type(d.runs) ~= "table" then d.runs = {} end
   if type(d.collapsed) ~= "table" then d.collapsed = {} end
   if type(d.panel) ~= "table" then d.panel = {} end
   d.confirmAbove = tonumber(d.confirmAbove) or 2
   if d.confirmAbove < 2 or d.confirmAbove > 4 then d.confirmAbove = 2 end
   d.valueGold = math.max(0, tonumber(d.valueGold) or 10)
   d.ilvlCap = math.max(0, tonumber(d.ilvlCap) or 0)
+  if type(d.sortProfit) ~= "boolean" then d.sortProfit = false end
   -- "spell" was a stopgap while the dead-click was being tracked down; the real
   -- cause was click registration, so put everyone back on the macro path once.
   if d.clickModeVersion ~= 2 then d.clickMode, d.clickModeVersion = "macro", 2 end
@@ -307,6 +323,14 @@ local function db()
     if type(e) ~= "table" or type(e.t) ~= "number" or type(e.out) ~= "string"
         or type(e.n) ~= "number" or e.n < 1 then table.remove(d.audit, i) end
   end
+  for i = #d.runs, 1, -1 do
+    local r = d.runs[i]
+    if type(r) ~= "table" or type(r.start) ~= "number"
+        or type(r.finish) ~= "number" or type(r.totals) ~= "table" then
+      table.remove(d.runs, i)
+    end
+  end
+  d.schemaVersion = math.max(schema, DB_SCHEMA)
   return d
 end
 
@@ -314,6 +338,7 @@ end
 -- goes on the keep list); un-protecting it is deliberately not, so a guard you
 -- waved past today is back tomorrow.
 local allowed = {}
+local filterText = ""
 
 --------------------------------------------------------------------------------
 -- Odds and ends the guards lean on.
@@ -379,6 +404,47 @@ local function valueOf(itemID, sellPrice, count)
   end
   if sellPrice and sellPrice > 0 then return sellPrice * (count or 1), "vendor" end
   return nil, nil
+end
+
+-- Approximate expected material value. The probabilities are intentionally
+-- conservative and the UI labels the result as an estimate; missing market
+-- prices suppress it entirely rather than presenting a misleading partial
+-- total. Rare/epic items use their dominant shard/crystal result.
+local UNCOMMON_MATS = {
+  {15,10940,10938}, {20,10940,10939,10978}, {25,10940,10998,10978},
+  {30,11083,11082,11084}, {35,11083,11134,11138}, {40,11137,11135,11139},
+  {45,11137,11174,11177}, {50,11176,11175,11178}, {55,11176,16202,14343},
+  {60,16204,16203,14344}, {65,22445,22447,22448}, {99,22445,22446,22448},
+  {200,22445,nil,22448},
+}
+local RARE_MATS = {
+  {25,10978}, {30,11084}, {35,11138}, {40,11139}, {45,11177},
+  {50,11178}, {55,14343}, {60,14344}, {65,22448}, {99,22449}, {200,22449},
+}
+local EPIC_MATS = { {45,14343}, {50,14344}, {60,20725}, {200,22450} }
+
+local function marketPrice(itemID)
+  if not itemID then return 0 end
+  local price, src = valueOf(itemID, nil, 1)
+  return src == "ah" and price or nil
+end
+
+local function expectedDisenchantValue(quality, ilvl)
+  local bands = quality == 2 and UNCOMMON_MATS or quality == 3 and RARE_MATS or EPIC_MATS
+  if WOW_PROJECT_ID == (WOW_PROJECT_CLASSIC or 2) then
+    if quality == 2 and ilvl > 55 then ilvl = 60 end
+    if quality == 3 and ilvl > 55 then ilvl = 60 end
+    if quality == 4 and ilvl > 50 then ilvl = 60 end
+  end
+  local band
+  for _, b in ipairs(bands) do if ilvl <= b[1] then band = b; break end end
+  band = band or bands[#bands]
+  if quality ~= 2 then return marketPrice(band[2]) end
+  local dust, essence, shard = marketPrice(band[2]), marketPrice(band[3]), marketPrice(band[4])
+  if not dust or (band[3] and not essence) or (band[4] and not shard) then return nil end
+  -- Approximate classic uncommon distribution: mostly dust, sometimes essence,
+  -- rarely a shard. Quantities are expected stack sizes, not guaranteed drops.
+  return dust * 1.875 + (essence or 0) * 0.3 + (shard or 0) * 0.05
 end
 
 --- Pawn's own "should this have an upgrade arrow" test, if Pawn is loaded.
@@ -499,12 +565,15 @@ function DE.Scan()
         if name and isDisenchantable(classID, subID, quality, invType) then
           local yield, skillNeeded = yieldFor(quality, ilvl)
           local value, valueSrc = valueOf(info.itemID, sellPrice, info.stackCount or 1)
+          local deValue = expectedDisenchantValue(quality, ilvl)
           local it = {
             bag = bag, slot = slot, itemID = info.itemID,
             name = name, link = info.hyperlink or link, icon = info.iconFileID,
             quality = quality, ilvl = ilvl, count = info.stackCount or 1,
             yield = yield, skillNeeded = skillNeeded,
             value = value, valueSrc = valueSrc,
+            deValue = deValue and math.floor(deValue + 0.5) or nil,
+            profit = deValue and value and math.floor(deValue - value + 0.5) or nil,
             boe = (bindType == 2) and not info.isBound,
             setID = setID,
             isRelic = (classID == 4 and RELIC_SUB[subID]) or invType == "INVTYPE_RELIC",
@@ -528,6 +597,11 @@ function DE.Scan()
   -- Cheapest first inside each bucket: you work down a bag of greens from the
   -- top, and the top row is always the one you care least about.
   local function order(a, b)
+    if db().sortProfit and a.profit ~= b.profit then
+      if a.profit == nil then return false end
+      if b.profit == nil then return true end
+      return a.profit > b.profit
+    end
     local av, bv = a.value or math.huge, b.value or math.huge
     if av ~= bv then return av < bv end
     if a.quality ~= b.quality then return a.quality < b.quality end
@@ -586,6 +660,7 @@ function DE.ScanTrash()
             bag = bag, slot = slot, itemID = info.itemID,
             name = name, link = info.hyperlink or link, icon = info.iconFileID,
             quality = quality, count = count,
+            isBound = info.isBound,
             vendor = (sellPrice or 0) * count,
             value = value, valueSrc = valueSrc,
             isQuest = isQuestItem(bag, slot, info.itemID),
@@ -715,6 +790,10 @@ local function noteLoot(msg)
   local n = tonumber(count) or 1
   DE.tally[link] = (DE.tally[link] or 0) + n
   auditAppend(lastDESource, link, n)
+  -- A disenchant produces one material loot event. Close the transaction as
+  -- soon as that event is accepted so a second personal loot line inside the
+  -- old time window can never be attached to the completed cast.
+  lastDE, lastDESource = 0, nil
 end
 
 local pendingTrash
@@ -730,28 +809,35 @@ local function finishPendingTrash()
   local p = pendingTrash
   if not p then return end
   local now = C.GetContainerItemInfo(p.bag, p.slot)
-  if now and now.itemID == p.it.itemID and (now.stackCount or 1) == p.it.count then return end
+  if now and now.itemID == p.it.itemID and (now.stackCount or 1) == p.it.count
+      and (not p.hyperlink or now.hyperlink == p.hyperlink)
+      and (p.isBound == nil or now.isBound == p.isBound) then return end
   pendingTrash = nil
   recordTrashDeletion(p.it)
 end
 
 local function deleteTrash(it, bag, slot)
   local now = C.GetContainerItemInfo(bag, slot)
-  if not (now and now.itemID == it.itemID and (now.stackCount or 1) == it.count) then
+  if not (now and now.itemID == it.itemID and (now.stackCount or 1) == it.count
+      and (not it.link or not now.hyperlink or now.hyperlink == it.link)
+      and (it.isBound == nil or now.isBound == it.isBound)) then
     return false, "the bag slot changed"
   end
   ClearCursor()
   if not C.PickupContainerItem(bag, slot) then return false, "item pickup is unavailable" end
   if CursorHasItem and not CursorHasItem() then return false, "the item was not picked up" end
   if not DeleteCursorItem then ClearCursor(); return false, "deletion is unavailable" end
-  pendingTrash = { it = it, bag = bag, slot = slot }
+  pendingTrash = { it = it, bag = bag, slot = slot,
+    hyperlink = now.hyperlink, isBound = now.isBound }
   DeleteCursorItem()
 
   -- Greys normally settle synchronously. Whites may open Blizzard's deletion
   -- confirmation; in that case BAG_UPDATE completes the audit only after the
   -- player accepts. A cancelled dialog therefore produces no success record.
   local after = C.GetContainerItemInfo(bag, slot)
-  if not (after and after.itemID == it.itemID and (after.stackCount or 1) == it.count) then
+  if not (after and after.itemID == it.itemID and (after.stackCount or 1) == it.count
+      and (not pendingTrash.hyperlink or after.hyperlink == pendingTrash.hyperlink)
+      and (pendingTrash.isBound == nil or after.isBound == pendingTrash.isBound)) then
     pendingTrash = nil
     auditAppend(it.link, "deleted", it.count, true)
     return true
@@ -826,6 +912,72 @@ local function roster()
   return members
 end
 
+local RUN_HISTORY_MAX = 20
+
+--- Freeze the current run into a compact summary independent of the capped
+--- audit log. Returns false when the marker has no material drops yet.
+local function archiveCurrentRun(name)
+  local d = db()
+  if not d.splitStart then return false end
+  local totals, order, drops = runTotals(d.splitStart)
+  if drops == 0 then return false end
+  local saved = { start = d.splitStart, finish = time(), drops = drops,
+    name = name or d.runName or ((GetRealZoneText and GetRealZoneText()) or "Run"),
+    members = roster(), totals = {} }
+  for _, out in ipairs(order) do
+    saved.totals[#saved.totals + 1] = { out = out, n = totals[out] }
+  end
+  d.runs[#d.runs + 1] = saved
+  while #d.runs > RUN_HISTORY_MAX do table.remove(d.runs, 1) end
+  return true
+end
+
+local function startRun(name)
+  local d = db()
+  archiveCurrentRun()
+  d.splitStart = time()
+  d.runName = name and name ~= "" and name or nil
+end
+
+function DE.RunHistory(args)
+  local d = db()
+  args = (args or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local op, value = args:match("^(%S+)%s*(.-)$")
+  op = (op or ""):lower()
+  if op == "name" then
+    if value == "" then pr("usage: /de runs name <text>") return end
+    d.runName = value
+    pr("current run named |cffffd100" .. value .. "|r.")
+    return
+  elseif op == "end" then
+    if archiveCurrentRun() then
+      d.splitStart, d.runName = nil, nil
+      pr("run archived.")
+    else
+      pr("the current run has no disenchant drops to archive.")
+    end
+    DE.Refresh()
+    return
+  elseif op == "clear" then
+    local n = #d.runs
+    d.runs = {}
+    pr(n == 0 and "run history was already empty." or ("cleared %d archived run%s."):format(n, n == 1 and "" or "s"))
+    DE.Refresh()
+    return
+  elseif args ~= "" then
+    pr("usage: /de runs [name <text>|end|clear]")
+    return
+  end
+  if #d.runs == 0 then pr("no archived runs yet.") return end
+  pr(("archived runs (%d):"):format(#d.runs))
+  for i = #d.runs, 1, -1 do
+    local r = d.runs[i]
+    print(("    %s  |cffffd100%s|r — %d drop%s, %d material type%s"):format(
+      date("%d %b %H:%M", r.start), r.name or "Run", r.drops or 0,
+      r.drops == 1 and "" or "s", #r.totals, #r.totals == 1 and "" or "s"))
+  end
+end
+
 --- /de split [start|say|party|raid]
 --- Totals the audit from the split marker (or login) and divides by the
 --- current group. Printing to a chat channel only ever happens on the explicit
@@ -834,7 +986,7 @@ function DE.Split(args)
   local d = db()
   args = args:lower()
   if args == "start" then
-    d.splitStart = time()
+    startRun()
     pr("split marker set — |cffffd100/de split|r now totals everything from this moment.")
     return
   end
@@ -929,17 +1081,17 @@ local function rowWidth()
 end
 
 local BUCKETS = {
-  { key = "safe",    title = "Safe to disenchant",  color = "|cff33cc44" },
-  { key = "confirm", title = "Check first",         color = "|cffffd100" },
-  { key = "blocked", title = "Protected",           color = "|cffff5555" },
+  { key = "safe",    title = "[OK] Safe to disenchant", color = "|cff33cc44" },
+  { key = "confirm", title = "[CHECK] Check first",     color = "|cffffd100" },
+  { key = "blocked", title = "[LOCKED] Protected",      color = "|cffff5555" },
 }
 
 -- The Trash tab's buckets. `key` picks the list out of the scan; `col` keeps
 -- its collapse state separate from the disenchant tab's.
 local TRASH_BUCKETS = {
-  { key = "safe",    col = "tsafe",    title = "Junk — click deletes it", color = "|cff33cc44" },
-  { key = "confirm", col = "tconfirm", title = "Check first",             color = "|cffffd100" },
-  { key = "blocked", col = "tblocked", title = "Protected",               color = "|cffff5555" },
+  { key = "safe",    col = "tsafe",    title = "[OK] Junk — click deletes it", color = "|cff33cc44" },
+  { key = "confirm", col = "tconfirm", title = "[CHECK] Check first",         color = "|cffffd100" },
+  { key = "blocked", col = "tblocked", title = "[LOCKED] Protected",          color = "|cffff5555" },
 }
 
 local function isCollapsed(key) return db().collapsed[key] == true end
@@ -990,6 +1142,7 @@ end
 local function arm(row, tier, bag, slot)
   setAction(row, "", nil, nil, nil, nil)
   setAction(row, "ctrl-", nil, nil, nil, nil)
+  row.cancelCast = nil
   row.deBag, row.deSlot, row.deTier = nil, nil, nil
   row.trashBag, row.trashSlot = nil, nil
   if not (bag and slot and tier ~= "blocked") then return end
@@ -1000,6 +1153,16 @@ local function arm(row, tier, bag, slot)
     setAction(row, prefix, "spell", deName(), bag, slot)
   end
   row.deBag, row.deSlot, row.deTier = bag, slot, tier
+end
+
+--- While this row's item is actively being disenchanted, turn the same row
+--- into a cancel button. `/stopcasting` remains a secure, hardware-triggered
+--- action; no ordinary Lua handler attempts to stop a protected cast. It has
+--- no item target attributes, so the cancelling click cannot touch a bag slot.
+local function armCancel(row)
+  arm(row, "blocked")
+  setAction(row, "", "macro", "/stopcasting", nil, nil)
+  row.cancelCast = true
 end
 
 --- Trash rows carry no secure action at all — deleting an item isn't a
@@ -1101,17 +1264,25 @@ local function itemRow(i)
   row.allow:SetScript("OnClick", function(self)
     local it = self:GetParent().item
     if not it then return end
-    allowed[it.itemID] = true
-    pr(("%s allowed for this session — Ctrl-click to %s it."):format(it.link,
-      it.trash and "delete" or "disenchant"))
+    if allowed[it.itemID] then
+      allowed[it.itemID] = nil
+      pr(("%s is protected by its guards again."):format(it.link))
+    else
+      allowed[it.itemID] = true
+      pr(("%s allowed for this session — Ctrl-click to %s it."):format(it.link,
+        it.trash and "delete" or "disenchant"))
+    end
     DE.Refresh()
   end)
   row.allow:SetScript("OnEnter", function(self)
     local it = self:GetParent().item
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Ignore the guard for this session", 1, 1, 1)
-    GameTooltip:AddLine(("The row moves to Check first; a Ctrl-click will then %s it. Forgotten on logout.")
-      :format(it and it.trash and "delete" or "disenchant"), 0.6, 0.6, 0.6, true)
+    GameTooltip:SetText(it and allowed[it.itemID]
+      and "Restore guard protection" or "Ignore the guard for this session", 1, 1, 1)
+    GameTooltip:AddLine(it and allowed[it.itemID]
+      and "Undo the session override and apply all guards again."
+      or (("The row moves to Check first; a Ctrl-click will then %s it. Forgotten on logout.")
+        :format(it and it.trash and "delete" or "disenchant")), 0.6, 0.6, 0.6, true)
     GameTooltip:Show()
   end)
   row.allow:SetScript("OnLeave", tipHide)
@@ -1144,12 +1315,19 @@ local function itemRow(i)
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
     GameTooltip:SetBagItem(it.bag, it.slot)
     GameTooltip:AddLine(" ")
+    GameTooltip:AddLine(("Bag %d, slot %d"):format(it.bag, it.slot), 0.55, 0.55, 0.55)
     if it.yield then GameTooltip:AddLine("Disenchants into: " .. it.yield, 0.6, 0.85, 1, true) end
     if it.value then
       GameTooltip:AddLine(("Worth %s%s"):format(money(it.value),
         it.valueSrc == "ah" and " on the AH" or " to a vendor"), 0.9, 0.9, 0.6)
     end
-    if it.tier == "blocked" then
+    if it.deValue then
+      GameTooltip:AddLine(("Estimated disenchant value: %s"):format(money(it.deValue)), 0.55, 0.85, 1)
+      GameTooltip:AddLine("Uses current Auctionator/TSM material prices and approximate drop odds.", 0.55, 0.55, 0.55, true)
+    end
+    if it.casting then
+      GameTooltip:AddLine("Click again to cancel this disenchant.", 0.75, 0.5, 1)
+    elseif it.tier == "blocked" then
       GameTooltip:AddLine("Protected: " .. (it.reason or "?"), 1, 0.4, 0.4, true)
       GameTooltip:AddLine(it.permanent and "Use the padlock to take it off your keep list."
         or "Press Allow to override for this session.", 0.6, 0.6, 0.6, true)
@@ -1181,7 +1359,7 @@ local function itemRow(i)
         it and it.link or "nil", it and it.tier or "nil",
         tostring(self:GetAttribute("type"))))
     end
-    if not (it and it.bag) then return end
+    if self.cancelCast or not (it and it.bag) then return end
     local now = C.GetContainerItemInfo(it.bag, it.slot)
     DE._pending = (now and now.itemID == it.itemID) and it or nil
     DE._pendingAt = GetTime()
@@ -1272,12 +1450,26 @@ function DE.Refresh()
   else
     safe, confirm, blocked = DE.Scan()
   end
+  if filterText ~= "" then
+    local needle = filterText:lower()
+    local function filter(list)
+      for i = #list, 1, -1 do
+        local it = list[i]
+        if not ((it.name or ""):lower():find(needle, 1, true)
+            or (it.reason or ""):lower():find(needle, 1, true)) then
+          table.remove(list, i)
+        end
+      end
+    end
+    filter(safe); filter(confirm); filter(blocked)
+  end
   local lists = { safe = safe, confirm = confirm, blocked = blocked }
 
   win.hint:SetText(trash
     and "Click a row to delete it forever — Ctrl-click a white item."
     or "Click a green row to disenchant it — Ctrl-click an amber one.")
-  win.empty:SetText(trash and "No junk in your bags" or "Nothing disenchantable in your bags")
+  win.empty:SetText(filterText ~= "" and ("No items match “" .. filterText .. "”")
+    or (trash and "No junk in your bags" or "Nothing disenchantable in your bags"))
 
   win.castingRow = nil
   -- Without Disenchant a row has nothing safe to do: leave it unarmed rather
@@ -1317,7 +1509,8 @@ function DE.Refresh()
           -- key, and it's what deleting the row costs you.
           row.name:SetText(("%s%s|r%s  |cff888888%s|r"):format(
             qcolor(it.quality), it.name, it.count > 1 and (" x" .. it.count) or "",
-            it.vendor > 0 and money(it.vendor) or "worthless"))
+            (it.vendor > 0 and money(it.vendor) or "worthless")
+              .. (it.valueSrc == "ah" and " · AH-priced" or " · vendor")))
           if it.tier == "safe" then
             row.note:SetText("|cff777777click to delete — gone for good|r")
           else
@@ -1325,12 +1518,15 @@ function DE.Refresh()
               .. (it.reason or "") .. "|r")
           end
         else
-          row.name:SetText(("%s%s|r%s  |cff888888i%d|r"):format(
-            qcolor(it.quality), it.name, it.count > 1 and (" x" .. it.count) or "", it.ilvl))
+          row.name:SetText(("%s%s|r%s  |cff888888i%d%s|r"):format(
+            qcolor(it.quality), it.name, it.count > 1 and (" x" .. it.count) or "", it.ilvl,
+            it.valueSrc == "ah" and " · AH" or (it.valueSrc == "vendor" and " · vendor" or "")))
           if it.casting then
-            row.note:SetText("|cffb37ce8Disenchanting...|r")
+            row.note:SetText("|cffb37ce8Disenchanting... click again to cancel|r")
           elseif it.tier == "safe" then
-            row.note:SetText("|cff777777" .. (it.yield or "") .. "|r")
+            local profit = it.profit and ((it.profit >= 0 and " · |cff55bb66est. +" or " · |cffff6666est. −")
+              .. money(math.abs(it.profit)) .. "|r") or ""
+            row.note:SetText("|cff777777" .. (it.yield or "") .. "|r" .. profit)
           else
             row.note:SetText((it.tier == "confirm" and "|cffbfa640Ctrl-click: " or "|cffbf5555")
               .. (it.reason or "") .. "|r")
@@ -1340,13 +1536,17 @@ function DE.Refresh()
         if it.casting then win.castingRow = row end
         row.lock:Show() -- the Run tab hides it
         row.lock:SetNormalTexture(db().keep.items[it.itemID] and LOCKED or UNLOCKED)
-        row.allow:SetShown(it.tier == "blocked" and not it.permanent)
+        row.allow:SetText(allowed[it.itemID] and "Restore" or "Allow")
+        row.allow:SetWidth(allowed[it.itemID] and 54 or 46)
+        row.allow:SetShown((it.tier == "blocked" and not it.permanent) or allowed[it.itemID])
         if trash then
           armTrash(row, it.tier, it.bag, it.slot)
         else
-          -- A casting row is never armed: its item is locked, so a second
-          -- click could only produce an error mid-cast.
-          arm(row, (it.casting or not canCast) and "blocked" or it.tier, it.bag, it.slot)
+          if it.casting then
+            armCancel(row)
+          else
+            arm(row, not canCast and "blocked" or it.tier, it.bag, it.slot)
+          end
         end
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", 0, y)
@@ -1367,7 +1567,7 @@ function DE.Refresh()
   win.status:SetText(statusText(safe, confirm, blocked))
   if win.opts and win.opts:IsShown() then DE.RefreshOptions() end
   -- The broker always shows disenchant counts; on the trash tab it rescans.
-  if trash then DE.UpdateBroker() else DE.UpdateBroker(#safe, #confirm) end
+  if trash or filterText ~= "" then DE.UpdateBroker() else DE.UpdateBroker(#safe, #confirm) end
 end
 
 --------------------------------------------------------------------------------
@@ -1473,6 +1673,20 @@ function DE.RefreshRun()
     end
   end
 
+  head("runhistory", ("|cffb37ce8History|r  |cff888888(%d archived)|r"):format(#d.runs))
+  if not isCollapsed("runhistory") then
+    for i = #d.runs, math.max(1, #d.runs - 9), -1 do
+      local r = d.runs[i]
+      local produced = 0
+      for _, material in ipairs(r.totals) do produced = produced + (material.n or 0) end
+      line(nil, ("|cffffd100%s|r  |cff888888%s|r"):format(r.name or "Run",
+        date("%d %b %H:%M", r.start)),
+        ("|cff777777%d drop%s · %d material%s · %d member%s|r"):format(
+          r.drops or 0, r.drops == 1 and "" or "s", produced, produced == 1 and "" or "s",
+          #(r.members or {}), #(r.members or {}) == 1 and "" or "s"))
+    end
+  end
+
   for i = hi + 1, #win.heads do win.heads[i]:Hide() end
   for i = ri + 1, #win.rows do
     arm(win.rows[i], "blocked")
@@ -1562,6 +1776,22 @@ local function ensureOptions(parent)
   end)
   o.quality:SetScript("OnLeave", tipHide)
 
+  o.profit = CreateFrame("Button", nil, o, "UIPanelButtonTemplate")
+  o.profit:SetPoint("TOPLEFT", o.quality, "BOTTOMLEFT", 0, -6)
+  o.profit:SetPoint("RIGHT", -12, 0)
+  o.profit:SetHeight(22)
+  o.profit:SetScript("OnClick", function()
+    db().sortProfit = not db().sortProfit
+    DE.Refresh()
+  end)
+  o.profit:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Estimated disenchant profit", 1, 0.82, 0)
+    GameTooltip:AddLine("Uses Auctionator or TSM prices for the item and its likely materials. Missing prices remain unsorted.", 0.6, 0.6, 0.6, true)
+    GameTooltip:Show()
+  end)
+  o.profit:SetScript("OnLeave", tipHide)
+
   local hint = o:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   hint:SetPoint("BOTTOMLEFT", 12, 10)
   hint:SetPoint("BOTTOMRIGHT", -12, 10)
@@ -1579,6 +1809,7 @@ function DE.RefreshOptions()
   o.valueBox:SetText(tostring(d.valueGold))
   o.ilvlBox:SetText(tostring(d.ilvlCap))
   o.quality:SetText("Plain-click up to: " .. (CONFIRM_LABEL[d.confirmAbove] or "?"))
+  o.profit:SetText("Profit sorting: " .. (d.sortProfit and "On" or "Off"))
 end
 
 --------------------------------------------------------------------------------
@@ -1729,12 +1960,39 @@ local function ensureWindow()
   report:SetScript("OnClick", function() DE.Report() end)
   win.rescan, win.report = rescan, report
 
+  local search = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+  search:SetSize(120, 20)
+  search:SetPoint("BOTTOM", 0, 7)
+  search:SetAutoFocus(false)
+  search:SetMaxLetters(40)
+  search:SetTextInsets(6, 6, 0, 0)
+  search:SetScript("OnTextChanged", function(self, userInput)
+    if not userInput then return end
+    filterText = self:GetText():gsub("^%s+", ""):gsub("%s+$", "")
+    DE.Refresh()
+  end)
+  search:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+  search:SetScript("OnEscapePressed", function(self)
+    self:SetText(""); self:ClearFocus()
+  end)
+  search:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Filter items", 1, 1, 1)
+    GameTooltip:AddLine("Matches item names and safety reasons. Escape clears it.", 0.6, 0.6, 0.6, true)
+    GameTooltip:Show()
+  end)
+  search:SetScript("OnLeave", tipHide)
+  win.search = search
+
   -- The Run tab's bottom row, swapped in for Rescan/To chat by SetTab.
   local newRun = mk("New run", 80)
   newRun:SetPoint("BOTTOMLEFT", 6, 6)
   newRun:SetScript("OnClick", function()
+    local archived = archiveCurrentRun()
     db().splitStart = time()
-    pr("run marker set — the Run tab and /de split now count from this moment.")
+    db().runName = nil
+    pr((archived and "previous run archived; new" or "run")
+      .. " marker set — the Run tab and /de split now count from this moment.")
     DE.Refresh()
   end)
   newRun:SetScript("OnEnter", function(self)
@@ -1819,6 +2077,7 @@ function DE.SetTab(tab)
   local options = tab == "options"
   f.rescan:SetShown(not run and not options)
   f.report:SetShown(not run and not options)
+  f.search:SetShown(not run and not options)
   f.newRun:SetShown(run)
   f.announce:SetShown(run)
   f.opts:SetShown(options)
@@ -2233,6 +2492,12 @@ function DE.Command(rest)
     DE.Audit(args)
   elseif cmd == "split" then
     DE.Split(args)
+  elseif cmd == "runs" or cmd == "history" then
+    DE.RunHistory(args)
+  elseif cmd == "profit" then
+    db().sortProfit = not db().sortProfit
+    pr("estimated-profit sorting " .. (db().sortProfit and "|cff33cc44on|r." or "|cffff5555off|r."))
+    DE.Refresh()
   elseif cmd == "debug" then
     DE.Debug()
   elseif cmd == "mode" then
@@ -2241,7 +2506,7 @@ function DE.Command(rest)
     pr("click mode: |cffffd100" .. d.clickMode .. "|r")
     DE.Refresh()
   else
-    pr("commands: (no args) | trash | run | scan | keep <#id|name:text> | keep del <n> | keeps | value <gold> | ilvl <n> | confirm <green|blue|epic> | guard [name] | learned [clear] | tally | audit [n|clear] | split [start|say|party|raid] | mode | debug")
+    pr("commands: (no args) | trash | run | scan | keep <#id|name:text> | keep del <n> | keeps | value <gold> | ilvl <n> | confirm <green|blue|epic> | guard [name] | learned [clear] | tally | audit [n|clear] | split [start|say|party|raid] | runs [name <text>|end|clear] | profit | mode | debug")
   end
 end
 
@@ -2251,10 +2516,12 @@ SlashCmdList.DISENCHANTER = function(msg) DE.Command(msg) end
 
 DE._verdict = verdict
 DE._trashVerdict = trashVerdict
+DE._expectedDisenchantValue = expectedDisenchantValue
 DE._db = db
 DE._noteLoot = noteLoot
 DE._deleteTrash = deleteTrash
 DE._finishPendingTrash = finishPendingTrash
 DE._arm = arm
+DE._armCancel = armCancel
 DE._window = function() return win end
 DE._event = function(...) return ev:GetScript("OnEvent")(ev, ...) end

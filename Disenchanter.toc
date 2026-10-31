@@ -2,7 +2,7 @@
 ## Title: Disenchanter
 ## Notes: Guarded one-click disenchanting — plus a Trash tab for deleting junk when the bags are full.
 ## Author: dlicudi
-## Version: 0.5.0
+## Version: 0.6.0
 ## SavedVariables: DisenchanterDB
 ## X-Category: Professions
 ## OptionalDeps: Auctionator, Pawn, ItemRack, TradeSkillMaster

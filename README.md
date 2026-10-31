@@ -16,10 +16,21 @@ three buckets:
 
 Rows are sorted cheapest-first inside each bucket, so working through a bag of
 greens is: click the top row, wait for the cast, click the new top row.
+While a disenchant is casting, click its row again to cancel it. The active row
+temporarily becomes a secure `/stopcasting` button and cannot target an item.
 
 The compact panel can be moved and resized from its bottom-right grip; its size
 and position are remembered. Rows keep their larger two-line targets so the
 yield or safety reason stays visible even in the denser layout.
+
+The search box filters by item name or safety reason. Bucket labels include
+text markers (`[OK]`, `[CHECK]`, and `[LOCKED]`) so they do not rely on color
+alone, and item tooltips identify the exact bag and slot.
+
+When Auctionator or TradeSkillMaster has prices for both an item and its likely
+materials, rows show an approximate disenchant gain or loss. Enable **Profit
+sorting** in Options (or `/de profit`) to put the best estimated return first.
+The estimate uses approximate Classic drop odds and is guidance, not a promise.
 
 Each row shows what it's likely to turn into (`Arcane Dust / Greater Planar
 Essence / Small Prismatic Shard`) or, if it's held back, why.
@@ -132,8 +143,9 @@ move an item to Protected; the rest only ask for a Ctrl-click.
 
 Press **Allow** on a Protected row to drop it to "check first" for this session.
 That override is deliberately not saved: a guard you waved past today is back
-tomorrow. To protect something permanently, press its **padlock** — that's the
-keep list, and it survives logout.
+tomorrow. The button becomes **Restore**, so the override can be undone without
+logging out. To protect something permanently, press its **padlock** — that's
+the keep list, and it survives logout.
 
 ## Commands
 
@@ -153,6 +165,8 @@ keep list, and it survives logout.
 /de tally                 what you've disenchanted this session
 /de audit [n|clear]       the log: what → what, when, where, group size
 /de split [start|say|party|raid]   divide shards since the marker
+/de runs [name <text>|end|clear]   name, archive, list, or clear run history
+/de profit                toggle estimated-profit sorting
 /de mode                  swap how a row fires (see below)
 /de debug                 client/spell/attribute dump, and toggle click tracing
 ```
@@ -193,10 +207,14 @@ house rule, nothing is ever announced to chat except on the explicit
 `say`/`party`/`raid` argument.
 
 Two honest caveats: the log only sees **your** casts, and a loot line is
-attributed to a disenchant by landing within ~3 seconds of your cast
-finishing — only your own loot lines are considered, so a party member
-looting at that instant can't pollute it, but you looting a mob mid-cast
-still could.
+attributed to a disenchant by landing within ~3 seconds of your cast finishing.
+Only your own enchanting-material loot is accepted, and the pending transaction
+closes after its first accepted material line.
+
+Starting a new run archives the previous non-empty run. Up to 20 compact run
+summaries retain their name, time, roster, material totals, and drop count even
+after old audit rows roll off. Use `/de runs name <text>` to name the current
+run, `/de runs end` to archive it, and `/de runs` to list the history.
 
 ## Optional integrations
 

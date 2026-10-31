@@ -1,7 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-10-31
 
+- Clicking the active disenchant row again now cancels the cast. During the
+  cast the row becomes a secure `/stopcasting` action with no bag-slot target.
+- Added item/reason filtering, non-color bucket markers, bag/slot tooltip
+  details, visible price sources, and reversible session Allow overrides.
+- Added approximate disenchant profit display and optional profit sorting when
+  Auctionator or TSM has all required market prices.
+- Added named run history: starting a new run archives the previous non-empty
+  run, with compact summaries retained independently of the capped audit.
+- Added an explicit saved-data schema version and validation for run history.
+- Audit attribution now closes after the first accepted material loot event;
+  trash deletion also verifies hyperlink and binding identity before acting.
 - Reworked the window into a compact, resizable meter-style panel shared with
   Summon: slim title bar, state-tinted rows, tighter chrome, and remembered size
   and position. Item rows remain tall enough for explicit safety guidance.
