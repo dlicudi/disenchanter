@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Split static disenchant data and saved-variable repair into load-ordered
+  modules, keeping persistence and data maintenance out of runtime UI code.
+- Unified yield hints, skill requirements, and profit-estimate material IDs in
+  one band table so the two calculations cannot drift apart.
+- Saved-variable validation now runs once per database table instead of during
+  bag scans and sort comparisons.
+- Removed the duplicated user manual from the main Lua file and expanded data
+  consistency coverage for both Era and TBC rules.
+
 ## 0.6.0 — 2026-10-31
 
 - Clicking the active disenchant row again now cancels the cast. During the

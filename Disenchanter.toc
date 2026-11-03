@@ -8,4 +8,6 @@
 ## OptionalDeps: Auctionator, Pawn, ItemRack, TradeSkillMaster
 
 Disenchanter_Compat.lua
+Disenchanter_Data.lua
+Disenchanter_DB.lua
 Disenchanter.lua

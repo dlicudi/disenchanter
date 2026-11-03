@@ -28,7 +28,7 @@ GetCoinTextureString=function(v)return tostring(v)end; GetNumSkillLines=function
 IsSpellKnown=function()return true end; InCombatLockdown=function()return _G.IN_COMBAT or false end
 IsControlKeyDown=function()return false end; ClearCursor=function()end; LibStub=nil
 C_Timer={After=function(delay,fn)if delay < 1 then fn() end end}; C_Container={GetContainerNumSlots=function()return 0 end,GetContainerItemInfo=function()return nil end}
-dofile(arg[1]); dofile(arg[2]); local DE=Disenchanter; DE._event("PLAYER_LOGIN")
+dofile(arg[1]); dofile(arg[2]); dofile(arg[3]); dofile(arg[4]); local DE=Disenchanter; DE._event("PLAYER_LOGIN")
 local function item(q) local x={itemID=1,name="Test",quality=2,ilvl=10,boe=true,value=10000};for k,v in pairs(q or{})do x[k]=v end;return x end
 step("value zero disables disenchant guard",function()DisenchanterDB.valueGold=0;assert(DE._verdict(item(),nil)=="safe")end)
 step("positive value threshold guards BoEs",function()DisenchanterDB.valueGold=1;assert(DE._verdict(item({value=20000}),nil)=="confirm")end)
@@ -47,6 +47,17 @@ step("profit estimate requires and uses market prices",function()
   Auctionator={API={v1={GetAuctionPriceByItemID=function(_,id)return id and 100 or nil end}}}
   assert(DE._expectedDisenchantValue(2,20)>0)
   Auctionator=nil;assert(DE._expectedDisenchantValue(2,20)==nil)
+end)
+step("yield bands share display and pricing data",function()
+  for quality,bands in pairs(DisenchanterData.bands) do
+    assert(quality>=2 and quality<=4 and #bands>0)
+    local previous=0
+    for _,band in ipairs(bands) do
+      assert(band[1]>previous and type(band[2])=="number" and type(band[3])=="string")
+      assert(type(band[4])=="table" and type(band[4][1])=="number")
+      previous=band[1]
+    end
+  end
 end)
 step("slash toggles window",function()local w=DE._window();if w:IsShown()then w:Hide()end;DE.Command("");assert(w:IsShown());DE.Command("");assert(not w:IsShown())end)
 step("combat toggle is deferred",function()local w=DE._window();IN_COMBAT=true;DE.Command("");assert(not w:IsShown());IN_COMBAT=false;DE._event("PLAYER_REGEN_ENABLED");assert(w:IsShown())end)

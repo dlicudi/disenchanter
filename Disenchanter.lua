@@ -1,83 +1,6 @@
---[[
-  Disenchanter — a faster, safer way to work through a bag of greens.
-
-  One window lists every disenchantable item in your bags, sorted into three
-  buckets by what the guards think of it:
-
-     Safe        left-click the row and it disenchants.
-     Check first Ctrl-click required — blues/epics, valuable BoEs, ilvl over
-                 your cap. The extra modifier is the whole point.
-     Protected   no click does anything: keep list, quest items, relics, set
-                 pieces, Use: effects, gear that beats what you're wearing,
-                 anything Pawn calls an upgrade, anything in an ItemRack set.
-                 Press Allow on a row to drop it to "check first" for this
-                 session, or the padlock to protect it forever.
-
-  A second tab, Trash, is the same idea pointed at deletion: the grey and white
-  junk you'd destroy to free a slot when the bags are full. Sorted lowest
-  vendor value first, so the top row is always the cheapest thing to lose.
-  Click deletes a grey; whites need a Ctrl-click; the keep list, quest guard
-  and value guard protect the rest. Deleting works off the cursor, so it needs
-  no free bag slot and no vendor — which is the point.
-
-  A third tab, Run, is the audit on screen for dungeon and raid nights: the
-  materials produced since the run marker with the per-member split, and the
-  drop log (what → what, when, where). It reads the audit, never your bags, so
-  shards you walked in with are invisible to it. "New run" moves the marker;
-  "Announce" posts the split to party/raid — the only time it ever speaks.
-
-     DisenchanterDB = {
-       keep    = { items = { [12345] = true }, names = { "heirloom", ... } },
-       guards  = { quest = true, use = true, set = true, ... },  -- see GUARDS
-       confirmAbove = 2,   -- quality above this needs a Ctrl-click (2 = green)
-       valueGold    = 10,  -- BoEs worth more than this need a Ctrl-click
-       ilvlCap      = 0,   -- 0 = off; above this needs a Ctrl-click
-       learned = { [12345] = true },  -- server told us these can't be DE'd
-       audit = { { t, zone, src, out, n, grp }, ... },  -- newest last, capped
-       runs = { { name, start, finish, totals, members }, ... }, -- capped at 20
-       splitStart = 1755400000,       -- /de split start marker (epoch)
-       schemaVersion = 1,
-       collapsed = { safe = false, confirm = false, blocked = false },
-     }
-
-  Safety: the addon never casts anything on its own. Each row is a secure
-  button that casts Disenchant on YOUR click, on the row YOU clicked —
-  Blizzard's own protected-call rules make anything else impossible. The item
-  is named by the row's `target-bag` / `target-slot` attributes, which the
-  secure handler only applies if the cast actually put Disenchant on the
-  cursor (SpellCanTargetItem) — so a click whose cast didn't start, because
-  you don't know the spell, you're mid-cast, or you're dead, never uses,
-  equips, sells or mails the item. The moment your bags change every row is
-  disarmed until the list has been rebuilt, so a row can never fire at an
-  item that has since moved into that slot.
-
-  If a LibDataBroker display is installed (Titan Panel, Bazooka, ...) a
-  "Disenchanter" plugin appears showing the safe / check-first counts; click
-  opens the window, right-click prints the chat report. No libraries are
-  bundled — the object registers only when another addon provides LDB, and
-  everything else works the same without it.
-
-  Commands:
-     /de                      open the window
-     /de trash                open the window on the Trash tab
-     /de run                  open the window on the Run tab
-     /de scan                 print the verdicts to chat
-     /de keep <#id|name:text> never disenchant this
-     /de keep del <n>         drop keep-list entry n
-     /de keeps                list the keep list
-     /de value <gold>         BoE value that needs a Ctrl-click (0 = off)
-     /de ilvl <n>             item level that needs a Ctrl-click (0 = off)
-     /de confirm <green|blue|epic>  quality above which a Ctrl-click is needed
-     /de guard <name>         toggle a guard (no name = list them)
-     /de learned [clear]      items the server refused; clear forgets them
-     /de tally                what you've disenchanted this session
-     /de audit [n|clear]      the log: what → what, when, where, group size
-     /de split [start|say|party|raid]  divide shards since the marker
-     /de runs [name <text>|end|clear]  archived run summaries
-     /de profit              toggle estimated-profit sorting
-     /de mode                 swap macro / spell click plumbing (see README)
-     /de debug                dump click state and toggle per-click tracing
-]]
+-- Guarded disenchanting, trash deletion, and run accounting.
+-- User documentation and the release checklist live in README.md. Keep the
+-- safety rationale beside the secure-action code that enforces it.
 
 local DE = {}
 Disenchanter = DE -- global, mostly for /dump poking
@@ -126,94 +49,23 @@ end
 
 local function deName() return spellName(DE_SPELL, "Disenchant") end
 
---------------------------------------------------------------------------------
--- What disenchanting an item is likely to give you, and what skill it needs.
--- Bands are {maxItemLevel, requiredSkill, "likely mats"} for one quality; the
--- roll inside a band is dust vs essence vs shard, so all three are listed.
--- Approximate on purpose — it's a hint for "is this worth my time", not a
--- promise. TBC (2.5.x) tables; Era swaps in the vanilla ones below.
---------------------------------------------------------------------------------
-local YIELD = {
-  [2] = { -- Uncommon
-    { 15,  1,   "Strange Dust / Lesser Magic Essence" },
-    { 20,  1,   "Strange Dust / Greater Magic Essence / Small Glimmering Shard" },
-    { 25,  25,  "Strange Dust / Lesser Astral Essence / Small Glimmering Shard" },
-    { 30,  50,  "Soul Dust / Greater Astral Essence / Large Glimmering Shard" },
-    { 35,  75,  "Soul Dust / Lesser Mystic Essence / Small Glowing Shard" },
-    { 40,  100, "Vision Dust / Greater Mystic Essence / Large Glowing Shard" },
-    { 45,  125, "Vision Dust / Lesser Nether Essence / Small Radiant Shard" },
-    { 50,  150, "Dream Dust / Greater Nether Essence / Large Radiant Shard" },
-    { 55,  175, "Dream Dust / Lesser Eternal Essence / Small Brilliant Shard" },
-    { 60,  200, "Illusion Dust / Greater Eternal Essence / Large Brilliant Shard" },
-    { 65,  225, "Arcane Dust / Lesser Planar Essence / Small Prismatic Shard" },
-    { 99,  275, "Arcane Dust / Greater Planar Essence / Small Prismatic Shard" },
-    { 200, 325, "Arcane Dust / Small Prismatic Shard" },
-  },
-  [3] = { -- Rare
-    { 25,  1,   "Small Glimmering Shard" },
-    { 30,  50,  "Large Glimmering Shard" },
-    { 35,  75,  "Small Glowing Shard" },
-    { 40,  100, "Large Glowing Shard" },
-    { 45,  125, "Small Radiant Shard" },
-    { 50,  150, "Large Radiant Shard" },
-    { 55,  175, "Small Brilliant Shard" },
-    { 60,  200, "Large Brilliant Shard (rarely Nexus Crystal)" },
-    { 65,  225, "Small Prismatic Shard" },
-    { 99,  275, "Large Prismatic Shard" },
-    { 200, 325, "Large Prismatic Shard (rarely Void Crystal)" },
-  },
-  [4] = { -- Epic
-    { 45,  225, "Small Brilliant Shard" },
-    { 50,  225, "Large Brilliant Shard" },
-    { 60,  225, "Nexus Crystal" },
-    { 95,  300, "Void Crystal" },
-    { 200, 375, "Void Crystal" },
-  },
-}
+local BANDS = assert(DisenchanterData and DisenchanterData.bands,
+  "Disenchanter: data module did not load")
 
--- Era (vanilla) rules: Disenchant has no skill gate at all, and the mats stop
--- at the ilvl-60 tier -- no Arcane Dust, no Prismatic/Void. Detected by project
--- id so the same file ships to both clients.
-if WOW_PROJECT_ID == (WOW_PROJECT_CLASSIC or 2) then
-  YIELD = {
-    [2] = { -- Uncommon
-      { 15,  1, "Strange Dust / Lesser Magic Essence" },
-      { 20,  1, "Strange Dust / Greater Magic Essence / Small Glimmering Shard" },
-      { 25,  1, "Strange Dust / Lesser Astral Essence / Small Glimmering Shard" },
-      { 30,  1, "Soul Dust / Greater Astral Essence / Large Glimmering Shard" },
-      { 35,  1, "Soul Dust / Lesser Mystic Essence / Small Glowing Shard" },
-      { 40,  1, "Vision Dust / Greater Mystic Essence / Large Glowing Shard" },
-      { 45,  1, "Vision Dust / Lesser Nether Essence / Small Radiant Shard" },
-      { 50,  1, "Dream Dust / Greater Nether Essence / Large Radiant Shard" },
-      { 55,  1, "Dream Dust / Lesser Eternal Essence / Small Brilliant Shard" },
-      { 200, 1, "Illusion Dust / Greater Eternal Essence / Large Brilliant Shard" },
-    },
-    [3] = { -- Rare
-      { 25,  1, "Small Glimmering Shard" },
-      { 30,  1, "Large Glimmering Shard" },
-      { 35,  1, "Small Glowing Shard" },
-      { 40,  1, "Large Glowing Shard" },
-      { 45,  1, "Small Radiant Shard" },
-      { 50,  1, "Large Radiant Shard" },
-      { 55,  1, "Small Brilliant Shard" },
-      { 200, 1, "Large Brilliant Shard (rarely Nexus Crystal)" },
-    },
-    [4] = { -- Epic
-      { 45,  1, "Small Brilliant Shard" },
-      { 50,  1, "Large Brilliant Shard" },
-      { 200, 1, "Nexus Crystal" },
-    },
-  }
+local function bandFor(quality, ilvl)
+  local bands = BANDS[quality]
+  if not bands then return nil end
+  for _, band in ipairs(bands) do
+    if ilvl <= band[1] then return band end
+  end
+  return bands[#bands]
 end
 
 local function yieldFor(quality, ilvl)
-  local bands = YIELD[quality]
+  local bands = BANDS[quality]
   if not bands then return nil, nil end
-  for _, b in ipairs(bands) do
-    if ilvl <= b[1] then return b[3], b[2] end
-  end
-  local last = bands[#bands]
-  return last[3], last[2]
+  local band = bandFor(quality, ilvl)
+  return band[3], band[2]
 end
 
 --------------------------------------------------------------------------------
@@ -273,65 +125,9 @@ local GUARDS = {
   { key = "value",    hard = false, label = "Valuable BoEs (see /de value)" },
 }
 
+local DB = assert(DisenchanterDBStore, "Disenchanter: database module did not load")
 local function db()
-  if type(DisenchanterDB) ~= "table" then DisenchanterDB = {} end
-  local d = DisenchanterDB
-  -- Sequential schema migrations belong here. Repair below remains defensive
-  -- for hand-edited or partially-written SavedVariables, while the version
-  -- makes intentional format changes explicit and testable.
-  local schema = tonumber(d.schemaVersion) or 0
-  if schema < 1 then
-    -- Version 1 records the normalized shape introduced with the compact UI.
-    -- No keys need renaming; existing data is repaired below before stamping.
-    schema = 1
-  end
-  if type(d.keep) ~= "table" then d.keep = {} end
-  if type(d.keep.items) ~= "table" then d.keep.items = {} end
-  if type(d.keep.names) ~= "table" then d.keep.names = {} end
-  if type(d.learned) ~= "table" then d.learned = {} end
-  if type(d.audit) ~= "table" then d.audit = {} end
-  if type(d.runs) ~= "table" then d.runs = {} end
-  if type(d.collapsed) ~= "table" then d.collapsed = {} end
-  if type(d.panel) ~= "table" then d.panel = {} end
-  d.confirmAbove = tonumber(d.confirmAbove) or 2
-  if d.confirmAbove < 2 or d.confirmAbove > 4 then d.confirmAbove = 2 end
-  d.valueGold = math.max(0, tonumber(d.valueGold) or 10)
-  d.ilvlCap = math.max(0, tonumber(d.ilvlCap) or 0)
-  if type(d.sortProfit) ~= "boolean" then d.sortProfit = false end
-  -- "spell" was a stopgap while the dead-click was being tracked down; the real
-  -- cause was click registration, so put everyone back on the macro path once.
-  if d.clickModeVersion ~= 2 then d.clickMode, d.clickModeVersion = "macro", 2 end
-  if type(d.guards) ~= "table" then
-    d.guards = {}
-  end
-  for _, g in ipairs(GUARDS) do
-    if type(d.guards[g.key]) ~= "boolean" then d.guards[g.key] = (g.key ~= "boe") end
-  end
-  -- Drop malformed entries rather than letting an old or hand-edited saved
-  -- variable break every scan. Valid historical audit rows are retained.
-  for id, kept in pairs(d.keep.items) do
-    if type(id) ~= "number" or kept ~= true then d.keep.items[id] = nil end
-  end
-  for i = #d.keep.names, 1, -1 do
-    if type(d.keep.names[i]) ~= "string" then table.remove(d.keep.names, i) end
-  end
-  for id, learned in pairs(d.learned) do
-    if type(id) ~= "number" or learned ~= true then d.learned[id] = nil end
-  end
-  for i = #d.audit, 1, -1 do
-    local e = d.audit[i]
-    if type(e) ~= "table" or type(e.t) ~= "number" or type(e.out) ~= "string"
-        or type(e.n) ~= "number" or e.n < 1 then table.remove(d.audit, i) end
-  end
-  for i = #d.runs, 1, -1 do
-    local r = d.runs[i]
-    if type(r) ~= "table" or type(r.start) ~= "number"
-        or type(r.finish) ~= "number" or type(r.totals) ~= "table" then
-      table.remove(d.runs, i)
-    end
-  end
-  d.schemaVersion = math.max(schema, DB_SCHEMA)
-  return d
+  return DB.Get(GUARDS, DB_SCHEMA)
 end
 
 -- Overrides live for the session only. Protecting something is permanent (it
@@ -406,23 +202,6 @@ local function valueOf(itemID, sellPrice, count)
   return nil, nil
 end
 
--- Approximate expected material value. The probabilities are intentionally
--- conservative and the UI labels the result as an estimate; missing market
--- prices suppress it entirely rather than presenting a misleading partial
--- total. Rare/epic items use their dominant shard/crystal result.
-local UNCOMMON_MATS = {
-  {15,10940,10938}, {20,10940,10939,10978}, {25,10940,10998,10978},
-  {30,11083,11082,11084}, {35,11083,11134,11138}, {40,11137,11135,11139},
-  {45,11137,11174,11177}, {50,11176,11175,11178}, {55,11176,16202,14343},
-  {60,16204,16203,14344}, {65,22445,22447,22448}, {99,22445,22446,22448},
-  {200,22445,nil,22448},
-}
-local RARE_MATS = {
-  {25,10978}, {30,11084}, {35,11138}, {40,11139}, {45,11177},
-  {50,11178}, {55,14343}, {60,14344}, {65,22448}, {99,22449}, {200,22449},
-}
-local EPIC_MATS = { {45,14343}, {50,14344}, {60,20725}, {200,22450} }
-
 local function marketPrice(itemID)
   if not itemID then return 0 end
   local price, src = valueOf(itemID, nil, 1)
@@ -430,18 +209,12 @@ local function marketPrice(itemID)
 end
 
 local function expectedDisenchantValue(quality, ilvl)
-  local bands = quality == 2 and UNCOMMON_MATS or quality == 3 and RARE_MATS or EPIC_MATS
-  if WOW_PROJECT_ID == (WOW_PROJECT_CLASSIC or 2) then
-    if quality == 2 and ilvl > 55 then ilvl = 60 end
-    if quality == 3 and ilvl > 55 then ilvl = 60 end
-    if quality == 4 and ilvl > 50 then ilvl = 60 end
-  end
-  local band
-  for _, b in ipairs(bands) do if ilvl <= b[1] then band = b; break end end
-  band = band or bands[#bands]
-  if quality ~= 2 then return marketPrice(band[2]) end
-  local dust, essence, shard = marketPrice(band[2]), marketPrice(band[3]), marketPrice(band[4])
-  if not dust or (band[3] and not essence) or (band[4] and not shard) then return nil end
+  local band = bandFor(quality, ilvl)
+  if not band then return nil end
+  local mats = band[4]
+  if quality ~= 2 then return marketPrice(mats[1]) end
+  local dust, essence, shard = marketPrice(mats[1]), marketPrice(mats[2]), marketPrice(mats[3])
+  if not dust or (mats[2] and not essence) or (mats[3] and not shard) then return nil end
   -- Approximate classic uncommon distribution: mostly dust, sometimes essence,
   -- rarely a shard. Quantities are expected stack sizes, not guaranteed drops.
   return dust * 1.875 + (essence or 0) * 0.3 + (shard or 0) * 0.05
@@ -546,7 +319,8 @@ end
 --- @return safe, confirm, blocked  three arrays of item records
 function DE.Scan()
   local safe, confirm, blocked = {}, {}, {}
-  local rack = db().guards.itemrack and itemRackIndex() or {}
+  local d = db()
+  local rack = d.guards.itemrack and itemRackIndex() or {}
   local skill = enchantingSkill()
 
   for bag = 0, NUM_BAG_SLOTS or 4 do
@@ -582,8 +356,8 @@ function DE.Scan()
             rackSet = rack[info.itemID],
             casting = casting or nil,
           }
-          it.beats = db().guards.upgrade and beatsEquipped(invType, ilvl, classID, subID) or nil
-          it.pawnUpgrade = db().guards.pawn and pawnSaysUpgrade(it.link) or false
+          it.beats = d.guards.upgrade and beatsEquipped(invType, ilvl, classID, subID) or nil
+          it.pawnUpgrade = d.guards.pawn and pawnSaysUpgrade(it.link) or false
 
           local tier, reason, permanent = verdict(it, skill)
           it.tier, it.reason, it.permanent = tier, reason, permanent
@@ -597,7 +371,7 @@ function DE.Scan()
   -- Cheapest first inside each bucket: you work down a bag of greens from the
   -- top, and the top row is always the one you care least about.
   local function order(a, b)
-    if db().sortProfit and a.profit ~= b.profit then
+    if d.sortProfit and a.profit ~= b.profit then
       if a.profit == nil then return false end
       if b.profit == nil then return true end
       return a.profit > b.profit

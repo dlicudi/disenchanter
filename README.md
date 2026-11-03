@@ -226,9 +226,9 @@ All soft — the addon works without any of them.
 
 ## Notes
 
-- The yield table (`YIELD` in `Disenchanter.lua`) is the TBC 2.5.x item-level
-  bands. It's a hint for "is this worth my time", not a promise — the actual roll
-  inside a band is dust vs essence vs shard.
+- `Disenchanter_Data.lua` holds the Era and TBC item-level bands used by both
+  yield hints and profit estimates. They're guidance, not a promise — the actual
+  roll inside a band is dust vs essence vs shard.
 - In combat the list freezes and greys out: arming a row means `SetAttribute`,
   which Blizzard forbids in combat. Opening or changing tabs is deferred until
   combat ends, and the secure rows are built safely at login.
@@ -243,10 +243,12 @@ npm run sync-addon    # or: ./sync.sh — copies into the WoW AddOns dir, then /
 
 ## Development and release checks
 
-`Disenchanter_Compat.lua` normalizes container APIs across supported clients;
-`Disenchanter.lua` contains the classification, audit, commands, and UI. Keeping
-the client-version shims separate prevents compatibility branches from leaking
-into the secure and destructive paths.
+The load order is intentionally small: `Disenchanter_Compat.lua` normalizes
+client APIs, `Disenchanter_Data.lua` owns static disenchant bands,
+`Disenchanter_DB.lua` migrates and repairs saved data once at login, and
+`Disenchanter.lua` contains runtime classification, audit, commands, and UI.
+This keeps compatibility, data, and persistence work out of the secure and
+destructive paths.
 
 Run the automated checks before packaging:
 
