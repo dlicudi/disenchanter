@@ -49,7 +49,8 @@ Each row carries a figure on the right: the estimated gain or loss from
 disenchanting on the Disenchant tab, the vendor value on Cleanup, the total
 worth on Run Split. Section headers add those figures up.
 
-The search box filters by item name or safety reason. Bucket labels include
+The filter box above the list, at the right of the summary line, filters by
+item name or safety reason. Bucket labels include
 text markers (`[OK]`, `[CHECK]`, and `[LOCKED]`) so they do not rely on color
 alone, and item tooltips identify the exact bag and slot.
 

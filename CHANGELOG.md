@@ -26,6 +26,9 @@
   appears only when the list overflows, and plain +/- section toggles. Empty
   sections no longer draw a "(0)" header, and zero counts in the summary line
   are muted. The padlock is faint until an item is actually on the keep list.
+- The filter box moved above the list, to the right of the summary line; the
+  footer now holds only the buttons. Your Enchanting rank, or the warning that
+  the character has no Disenchant, moved to the title bar.
 - Money is written as `4s 84c` instead of with coin icons, in the window,
   tooltips and chat.
 - Rows and the Next button now cast with `/cast [nocombat] Disenchant`, so a

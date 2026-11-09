@@ -1258,7 +1258,8 @@ local function tipHide() GameTooltip:Hide() end
 local win
 local pendingToggle, pendingTab, pendingShow = false, nil, false
 local WIN_W, WIN_H = 410, 460
-local MIN_W, MIN_H = 380, 420 -- wide enough for the footer: buttons, filter, Next
+local SEARCH_W = 130
+local MIN_W, MIN_H = 380, 420 -- wide enough for the tabs, and the counts beside the filter
 local MAX_W, MAX_H = 620, 760
 local ROW_W  = 372 -- initial width; resized rows are anchored to both edges
 local ROW_H  = 28
@@ -1886,22 +1887,27 @@ local function hideRest(hi, ri)
   end
 end
 
+--- The title bar's right-hand note: your Enchanting rank, or the one thing
+--- that stops every row working.
+local function skillText()
+  if not knowsDisenchant() then return "|cffff5555No Disenchant on this character|r" end
+  local skill = enchantingSkill()
+  return skill and ("|cff6f6a7aEnchanting " .. skill .. "|r") or ""
+end
+
+--- The summary line. Kept short: on the list tabs it shares its line with
+--- the filter box.
 local function statusText(safe, confirm, blocked)
   if InCombatLockdown() then
-    return "|cffff5555In combat|r — the list is frozen until you leave it."
+    return "|cffff5555In combat|r — the list is frozen"
   end
-  local skill = enchantingSkill()
   -- A count of zero is muted, so an empty bag isn't a traffic light of zeros.
   local function count(n, colour, what)
     return ("%s%d %s|r"):format(n > 0 and colour or "|cff666666", n, what)
   end
-  local counts = count(#safe, "|cff33cc44", "safe") .. "|cff666666  \194\183  |r"
+  return count(#safe, "|cff33cc44", "safe") .. "|cff666666  \194\183  |r"
     .. count(#confirm, "|cffffd100", "to check") .. "|cff666666  \194\183  |r"
     .. count(#blocked, "|cffff5555", "protected")
-  if not knowsDisenchant() then
-    return counts .. "   |cffff5555no Disenchant on this character|r"
-  end
-  return counts .. (skill and ("   |cff888888Enchanting " .. skill .. "|r") or "")
 end
 
 --- Gains are green. A loss is only red once it passes the /de loss
@@ -1920,6 +1926,7 @@ function DE.Refresh()
   -- Visible, not just shown: nothing is armed while the UI itself is hidden.
   -- OnShow redraws when it comes back.
   if not (win and win:IsVisible()) then return end
+  win.skill:SetText(skillText())
   if win.tab == "options" then
     DE.RefreshOptions()
     win.status:SetText("Settings" .. (DB.GetChar(GUARDS).own
@@ -2497,9 +2504,14 @@ local function ensureWindow()
   win = f
   win.rows, win.heads = {}, {}
 
+  -- Enchanting rank, or the no-Disenchant warning, beside the close button.
+  win.skill = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  win.skill:SetPoint("TOPRIGHT", -26, -5)
+  win.skill:SetJustifyH("RIGHT")
+
   win.status = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  win.status:SetPoint("TOPLEFT", 8, -25)
-  win.status:SetPoint("TOPRIGHT", -8, -25)
+  win.status:SetPoint("TOPLEFT", 8, -27)
+  win.status:SetPoint("TOPRIGHT", -(SEARCH_W + 14), -27) -- SetTab widens it off the list tabs
   win.status:SetJustifyH("LEFT")
   win.status:SetWordWrap(false)
 
@@ -2579,7 +2591,7 @@ local function ensureWindow()
   win.opts = ensureOptions(f)
   win.opts:SetFrameLevel(inset:GetFrameLevel() + 20)
 
-  -- Footer, list tabs: Rescan, To chat, the filter, and — on the Disenchant
+  -- Footer, list tabs: Rescan and To chat on the left and — on the Disenchant
   -- tab — the Next button in the corner.
   local rescan = flatButton(f, "Rescan", 58)
   rescan:SetPoint("BOTTOMLEFT", 6, 6)
@@ -2593,11 +2605,11 @@ local function ensureWindow()
   simpleTip(report, "Print to chat", "Lists every item and its verdict in your chat window. Only you see it.")
   win.rescan, win.report = rescan, report
 
-  -- Drawn flat like the buttons beside it, not from InputBoxTemplate.
+  -- The filter sits above the list it narrows, at the right-hand end of the
+  -- summary line. Drawn flat like the buttons, not from InputBoxTemplate.
   local search = CreateFrame("EditBox", nil, f)
-  search:SetHeight(22)
-  search:SetPoint("BOTTOMLEFT", 130, 6)
-  search:SetPoint("BOTTOMRIGHT", -160, 6)
+  search:SetSize(SEARCH_W, 18)
+  search:SetPoint("TOPRIGHT", -6, -23)
   search:SetFontObject("GameFontHighlightSmall")
   search:SetAutoFocus(false)
   search:SetMaxLetters(40)
@@ -2634,7 +2646,7 @@ local function ensureWindow()
     DE.Refresh()
   end)
   search:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetOwner(self, "ANCHOR_BOTTOMRIGHT")
     GameTooltip:SetText("Filter items", 1, 1, 1)
     GameTooltip:AddLine("Matches item names and safety reasons. Escape clears it.", 0.6, 0.6, 0.6, true)
     GameTooltip:Show()
@@ -2788,10 +2800,10 @@ function DE.SetTab(tab)
   f.rescan:SetShown(list)
   f.report:SetShown(list)
   f.search:SetShown(list)
-  -- The filter stretches into the corner the Next button leaves free.
-  -- In combat the button can't be hidden, so it keeps its corner until after.
-  local corner = tab == "de" or (InCombatLockdown() and f.next:IsShown())
-  f.search:SetPoint("BOTTOMRIGHT", corner and -160 or -20, 6)
+  -- The summary line gives way to the filter where there is one.
+  f.status:ClearAllPoints()
+  f.status:SetPoint("TOPLEFT", 8, -27)
+  f.status:SetPoint("TOPRIGHT", list and -(SEARCH_W + 14) or -8, -27)
   f.newRun:SetShown(tab == "split")
   f.announce:SetShown(tab == "split")
   f.opts:SetShown(tab == "options")
