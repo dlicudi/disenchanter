@@ -126,7 +126,7 @@ step("the Next button follows the top safe row; its key only lives on the open D
     DE.SetTab("de");local nb=w.next
     assert(nb:IsShown() and nb.item.itemID==11 and nb._attr.type1=="macro" and nb._attr["target-slot1"]==1)
     assert(nb._attr["ctrl-type1"]==nil and binds.F=="DisenchanterNextButton")
-    assert(nb._attr.macrotext1:find("[nocombat]",1,true) and not w.rows[1]._attr.macrotext1:find("[",1,true))
+    assert(nb._attr.macrotext1=="/cast [nocombat] Disenchant" and w.rows[1]._attr.macrotext1==nb._attr.macrotext1)
     local timers={};local immediate=C_Timer.After;C_Timer.After=function(_,fn)timers[#timers+1]=fn end
     DE._event("BAG_UPDATE",0);assert(nb._attr.type1==nil and nb.item==nil) -- disarmed at once
     C_Timer.After=immediate;timers[1]();assert(nb._attr.type1=="macro")

@@ -22,6 +22,9 @@
   section totals in the headers, a placeholder in the filter box, and a
   scrolling Settings tab organised into sections. The minimum window width is
   now 380.
+- Rows and the Next button now cast with `/cast [nocombat] Disenchant`, so a
+  button left armed when combat starts refuses on its own. (`/de mode spell`
+  cannot carry the condition and still relies on the game refusing the cast.)
 - Fixed: pressing Escape in the filter box emptied the box but left the list
   filtered.
 - Rows now hold their position while the window is open: a bag update no longer

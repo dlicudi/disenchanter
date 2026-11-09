@@ -38,8 +38,8 @@ single key with no modifier, the mouse wheel (`MOUSEWHEELUP` /
 `MOUSEWHEELDOWN`) or mouse buttons 3–5. The left and right mouse buttons are
 refused.
 
-The button's macro is `/cast [nocombat] Disenchant`: a secure button can't be
-disarmed once combat has started, so the refusal travels with the macro.
+The button uses the same `/cast [nocombat] Disenchant` macro as the rows, so
+it does nothing in combat even though it can't be disarmed then.
 
 The compact panel can be moved and resized from its bottom-right grip; its size
 and position are remembered. Rows keep their larger two-line targets so the
@@ -143,8 +143,11 @@ The addon never casts automatically. Each row is a Blizzard secure button
 carrying a plain macro that runs only on your click:
 
 ```
-/cast Disenchant
+/cast [nocombat] Disenchant
 ```
+
+The `[nocombat]` condition is there because a secure button can't be disarmed
+once combat starts; the macro refuses on its own until combat ends.
 
 That macro only ever runs on **your** click, on the row **you** clicked —
 Blizzard's protected-call rules make anything else impossible. There is no
@@ -262,8 +265,8 @@ The keep list, audit, run history and observed yields are always shared.
 
 ### /de mode
 
-`macro` (default) issues the cast through a `/cast Disenchant` macrotext;
-`spell` issues it through the button's `spell` attribute. In both modes the
+`macro` (default) issues the cast through a `/cast [nocombat] Disenchant`
+macrotext; `spell` issues it through the button's `spell` attribute. In both modes the
 item is applied by the secure template's `target-bag` / `target-slot`
 handling, only while Disenchant is on the cursor. Both work; the second exists
 in case a patch breaks macrotext.
@@ -372,7 +375,8 @@ every supported branch:
    and nothing else. Set a key with `/de key`, confirm it works on the
    Disenchant tab, does nothing on Cleanup, and returns to its normal binding
    when the window closes and when the interface is hidden with Alt-Z. Enter
-   combat with the window open and confirm the key does nothing.
+   combat with the window open and confirm the key and a click on a Safe row
+   both do nothing.
 7. Hover a disenchantable item in the bags and at a vendor or in a chat link;
    confirm the tooltip lines appear once and the bag item shows its verdict.
 8. Open Settings, scroll it, change a threshold, and toggle per-character

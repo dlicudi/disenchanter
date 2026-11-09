@@ -1278,10 +1278,14 @@ end
 --- PostClick — that just raises the "blocked from an action" popup.)
 ---
 --- Two ways to issue the cast, swappable with /de mode:
----   "macro" (default) — a `/cast Disenchant` macrotext.
+---   "macro" (default) — a `/cast [nocombat] Disenchant` macrotext. A
+---     secure button can't be disarmed once lockdown starts, so a row or the
+---     Next button can sit armed at a slot whose contents then change; the
+---     condition makes the macro itself refuse for as long as combat lasts.
 ---   "spell"           — the `spell` attribute. Kept in case a patch breaks
----     macrotext.
-local function arm(row, tier, bag, slot, outOfCombatOnly)
+---     macrotext. It can't carry a condition, so in combat it relies on the
+---     game refusing the cast.
+local function arm(row, tier, bag, slot)
   setAction(row, "", nil, nil, nil, nil)
   setAction(row, "ctrl-", nil, nil, nil, nil)
   row.cancelCast = nil
@@ -1290,10 +1294,7 @@ local function arm(row, tier, bag, slot, outOfCombatOnly)
   if not (bag and slot and tier ~= "blocked") then return end
   local prefix = (tier == "safe") and "" or "ctrl-"
   if db().clickMode == "macro" then
-    -- `outOfCombatOnly` is for the Next button: attributes can't be cleared
-    -- once lockdown starts, so its macro carries the refusal with it.
-    setAction(row, prefix, "macro",
-      "/cast " .. (outOfCombatOnly and "[nocombat] " or "") .. deName(), bag, slot)
+    setAction(row, prefix, "macro", "/cast [nocombat] " .. deName(), bag, slot)
   else
     setAction(row, prefix, "spell", deName(), bag, slot)
   end
@@ -1440,7 +1441,7 @@ local function syncNext(it)
   nb:SetShown(win.tab == "de")
   if not (win:IsVisible() and win.tab == "de") then it = nil end
   nb.item = it
-  if it then arm(nb, "safe", it.bag, it.slot, true) else arm(nb, "blocked") end
+  if it then arm(nb, "safe", it.bag, it.slot) else arm(nb, "blocked") end
   local key = KEY_BADGE[db().nextKey or ""] or db().nextKey
   local label
   if it then
@@ -2990,8 +2991,9 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
   elseif event == "PLAYER_REGEN_DISABLED" then
     -- The rows usually can't be disarmed here: on the clients this was built
     -- against lockdown is already active when the event fires, so SetAttribute
-    -- would be rejected. Harmless — the game refuses to cast Disenchant in
-    -- combat — so just grey the list. Where lockdown has not started yet,
+    -- would be rejected. Harmless — the macro carries [nocombat], and the
+    -- game refuses to cast Disenchant in combat anyway — so just grey the
+    -- list. Where lockdown has not started yet,
     -- take the chance: disarm everything and release the next-item key.
     if not InCombatLockdown() then
       disarmAll()
