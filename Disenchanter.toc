@@ -4,6 +4,7 @@
 ## Author: dlicudi
 ## Version: 0.6.0
 ## SavedVariables: DisenchanterDB
+## SavedVariablesPerCharacter: DisenchanterCharDB
 ## X-Category: Professions
 ## OptionalDeps: Auctionator, Pawn, ItemRack, TradeSkillMaster
 

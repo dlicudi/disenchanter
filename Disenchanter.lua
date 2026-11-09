@@ -113,6 +113,7 @@ end
 --------------------------------------------------------------------------------
 -- Every guard, in the order they're checked and shown. `hard` guards move an
 -- item to Protected (no click works); the rest only ask for a Ctrl-click.
+-- `off` guards start switched off.
 local GUARDS = {
   { key = "quest",    hard = true,  label = "Quest items" },
   { key = "relic",    hard = true,  label = "Relics (idol / libram / totem)" },
@@ -121,13 +122,22 @@ local GUARDS = {
   { key = "upgrade",  hard = true,  label = "Beats my equipped item" },
   { key = "pawn",     hard = true,  label = "Pawn calls it an upgrade" },
   { key = "itemrack", hard = true,  label = "In an ItemRack set" },
-  { key = "boe",      hard = false, label = "Any bind-on-equip item" },
+  { key = "boe",      hard = false, off = true, label = "Any bind-on-equip item" },
   { key = "value",    hard = false, label = "Valuable BoEs (see /de value)" },
+  { key = "loss",     hard = false, off = true, label = "Loses money to disenchant (see /de loss)" },
 }
 
 local DB = assert(DisenchanterDBStore, "Disenchanter: database module did not load")
 local function db()
   return DB.Get(GUARDS, DB_SCHEMA)
+end
+
+--- The guard switches and thresholds in force: this character's own when it
+--- opted in (/de char), the account's otherwise. Everything else — the keep
+--- list, the audit, runs — is always the account's, through db().
+local function cfg()
+  local c = DB.GetChar(GUARDS)
+  return c.own and c or db()
 end
 
 -- Overrides live for the session only. Protecting something is permanent (it
@@ -192,6 +202,22 @@ local KEPT, KEPT_ALL = "on your keep list", "on your keep list (every version of
 -- Odds and ends the guards lean on.
 --------------------------------------------------------------------------------
 local function money(copper) return GetCoinTextureString(copper or 0) end
+
+--- Money for a narrow column: from a gold upwards the copper is noise.
+local function shortMoney(copper)
+  copper = math.floor((copper or 0) + 0.5)
+  if copper >= 10000 then copper = copper - copper % 100 end
+  return GetCoinTextureString(copper)
+end
+
+--- Money with no texture escapes, for chat channels (which reject them).
+local function plainMoney(copper)
+  copper = math.floor((copper or 0) + 0.5)
+  local g, s, c = math.floor(copper / 10000), math.floor(copper % 10000 / 100), copper % 100
+  if g > 0 then return s > 0 and ("%dg %ds"):format(g, s) or ("%dg"):format(g) end
+  if s > 0 then return c > 0 and ("%ds %dc"):format(s, c) or ("%ds"):format(s) end
+  return ("%dc"):format(c)
+end
 
 --- Your Enchanting rank, or nil if we can't see it (collapsed skill headers).
 local function enchantingSkill()
@@ -260,9 +286,44 @@ local function marketPrice(itemID)
   return src == "ah" and price or nil
 end
 
+--------------------------------------------------------------------------------
+-- Observed yields. Every disenchant this addon attributes is counted against
+-- its band (quality + item-level bracket), so after YIELD_MIN of a kind the
+-- value estimate rests on what you actually got rather than on book odds.
+--------------------------------------------------------------------------------
+local YIELD_MIN = 25
+
+local function yieldKey(quality, band) return quality * 1000 + band[1] end
+
+local function recordYield(srcLink, matID, count)
+  if not srcLink then return end
+  local _, _, quality, ilvl = GetItemInfo(srcLink)
+  local band = quality and ilvl and bandFor(quality, ilvl)
+  if not band then return end
+  local yields, key = db().yields, yieldKey(quality, band)
+  local seen = yields[key]
+  if not seen then seen = { n = 0, mats = {} }; yields[key] = seen end
+  seen.n = seen.n + 1
+  local m = seen.mats[matID]
+  if not m then m = { h = 0, q = 0 }; seen.mats[matID] = m end
+  m.h, m.q = m.h + 1, m.q + count
+end
+
+--- @return expected copper from one disenchant, and — when the figure comes
+---         from your own results — how many disenchants it rests on
 local function expectedDisenchantValue(quality, ilvl)
   local band = bandFor(quality, ilvl)
   if not band then return nil end
+  local seen = db().yields[yieldKey(quality, band)]
+  if seen and seen.n >= YIELD_MIN then
+    local total, priced = 0, true
+    for id, m in pairs(seen.mats) do
+      local price = marketPrice(id)
+      if not price or price <= 0 then priced = false break end
+      total = total + price * m.q / seen.n
+    end
+    if priced and total > 0 then return total, seen.n end
+  end
   local mats = band[4]
   if quality ~= 2 then return marketPrice(mats[1]) end
   local dust, essence, shard = marketPrice(mats[1]), marketPrice(mats[2]), marketPrice(mats[3])
@@ -328,8 +389,8 @@ end
 -- so the most alarming checks come first.
 --------------------------------------------------------------------------------
 local function verdict(it, skill)
-  local d = db()
-  local g = d.guards
+  local d, s = db(), cfg()
+  local g = s.guards
 
   local kept, everyVersion = keptAs(it)
   if kept then return "blocked", everyVersion and KEPT_ALL or KEPT, true end
@@ -354,14 +415,20 @@ local function verdict(it, skill)
   end
 
   if g.boe and it.boe then return "confirm", "bind-on-equip" end
-  if g.value and d.valueGold > 0 and it.boe and it.value and it.value >= d.valueGold * 10000 then
+  if g.value and s.valueGold > 0 and it.boe and it.value and it.value >= s.valueGold * 10000 then
     return "confirm", ("worth %s%s"):format(money(it.value), it.valueSrc == "ah" and " on the AH" or " to a vendor")
   end
-  if it.quality > d.confirmAbove then
+  -- Only bites when both sides are priced: `profit` is nil without market
+  -- prices for the materials, so the guard stands down rather than guess.
+  if g.loss and it.profit and -it.profit > s.lossSilver * 100 then
+    return "confirm", ("loses about %s against %s"):format(shortMoney(-it.profit),
+      it.valueSrc == "ah" and "its AH price" or "vendoring it")
+  end
+  if it.quality > s.confirmAbove then
     return "confirm", (QUALITY_NAME[it.quality] or "high") .. " quality"
   end
-  if d.ilvlCap > 0 and it.ilvl > d.ilvlCap then
-    return "confirm", ("item level %d, over your cap of %d"):format(it.ilvl, d.ilvlCap)
+  if s.ilvlCap > 0 and it.ilvl > s.ilvlCap then
+    return "confirm", ("item level %d, over your cap of %d"):format(it.ilvl, s.ilvlCap)
   end
   return "safe", nil
 end
@@ -372,8 +439,8 @@ end
 --- @return safe, confirm, blocked  three arrays of item records
 function DE.Scan()
   local safe, confirm, blocked = {}, {}, {}
-  local d = db()
-  local rack = d.guards.itemrack and itemRackIndex() or {}
+  local d, g = db(), cfg().guards
+  local rack = g.itemrack and itemRackIndex() or {}
   local skill = enchantingSkill()
 
   for bag = 0, NUM_BAG_SLOTS or 4 do
@@ -392,7 +459,7 @@ function DE.Scan()
         if name and isDisenchantable(classID, subID, quality, invType) then
           local yield, skillNeeded = yieldFor(quality, ilvl)
           local value, valueSrc = valueOf(info.itemID, sellPrice, info.stackCount or 1)
-          local deValue = expectedDisenchantValue(quality, ilvl)
+          local deValue, deSeen = expectedDisenchantValue(quality, ilvl)
           local it = {
             bag = bag, slot = slot, itemID = info.itemID,
             key = itemKey(info.hyperlink, info.itemID),
@@ -402,6 +469,7 @@ function DE.Scan()
             yield = yield, skillNeeded = skillNeeded,
             value = value, valueSrc = valueSrc,
             deValue = deValue and math.floor(deValue + 0.5) or nil,
+            deSeen = deSeen,
             profit = deValue and value and math.floor(deValue - value + 0.5) or nil,
             boe = (bindType == 2) and not info.isBound,
             setID = setID,
@@ -411,8 +479,8 @@ function DE.Scan()
             rackSet = rack[info.itemID],
             casting = casting or nil,
           }
-          it.beats = d.guards.upgrade and beatsEquipped(invType, ilvl, classID, subID) or nil
-          it.pawnUpgrade = d.guards.pawn and pawnSaysUpgrade(it.link) or false
+          it.beats = g.upgrade and beatsEquipped(invType, ilvl, classID, subID) or nil
+          it.pawnUpgrade = g.pawn and pawnSaysUpgrade(it.link) or false
 
           local tier, reason, permanent = verdict(it, skill)
           it.tier, it.reason, it.permanent = tier, reason, permanent
@@ -452,7 +520,7 @@ local NEVER_DELETE = {
 }
 
 local function trashVerdict(it)
-  local d = db()
+  local d, s = db(), cfg()
   local kept, everyVersion = keptAs(it)
   if kept then return "blocked", everyVersion and KEPT_ALL or KEPT, true end
   for _, n in ipairs(d.keep.names) do
@@ -461,11 +529,11 @@ local function trashVerdict(it)
     end
   end
   if not allowed[keyOf(it)] then
-    if d.guards.quest and it.isQuest then return "blocked", "quest item" end
+    if s.guards.quest and it.isQuest then return "blocked", "quest item" end
     -- The value guard bites harder here than on the disenchant tab: deleting
     -- a stack of cloth is pure loss, so a valuable stack is Protected, not
     -- merely Ctrl-gated. Allow drops it to "check first" as usual.
-    if d.guards.value and d.valueGold > 0 and it.value and it.value >= d.valueGold * 10000 then
+    if s.guards.value and s.valueGold > 0 and it.value and it.value >= s.valueGold * 10000 then
       return "blocked", ("worth %s%s"):format(money(it.value),
         it.valueSrc == "ah" and " on the AH" or " to a vendor")
     end
@@ -514,13 +582,133 @@ function DE.ScanTrash()
   return safe, confirm, blocked
 end
 
---------------------------------------------------------------------------------
--- Chat report.
---------------------------------------------------------------------------------
 local function qcolor(q)
   local c = ITEM_QUALITY_COLORS[q]
   return c and c.hex or "|cffffffff"
 end
+
+--------------------------------------------------------------------------------
+-- Item tooltips. Anywhere an item tooltip appears — bags, the auction house,
+-- a loot roll, a chat link — a disenchantable item says what it turns into
+-- and what that is worth. Half the guards (bound state, quest text) can only
+-- be read from a bag slot, so a verdict exists only for a copy you are
+-- carrying — and the line says so, because the tooltip itself may be showing
+-- an auction or a link to the same item.
+--------------------------------------------------------------------------------
+local tipIndex          -- item key -> its scanned record; rebuilt lazily
+local tipQuiet = false  -- set while the window paints its own, fuller tooltip
+local tipWarned = false
+local tipTwoHooks = false -- both hook paths are installed; check before adding
+local TIER_RANK = { safe = 1, confirm = 2, blocked = 3 }
+local TIER_TEXT = {
+  safe    = "|cff55c96bSafe to disenchant|r",
+  confirm = "|cffd7ad45Ctrl-click|r",
+  blocked = "|cffb96a6aProtected|r",
+}
+
+--- The verdict for an item as it sits in your bags; with two copies that
+--- disagree (one bound, one not) the stricter one is reported.
+local function bagVerdict(key)
+  if not tipIndex then
+    tipIndex = {}
+    local safe, confirm, blocked = DE.Scan()
+    for _, list in ipairs({ safe, confirm, blocked }) do
+      for _, it in ipairs(list) do
+        local k = keyOf(it)
+        local old = tipIndex[k]
+        if not old or TIER_RANK[it.tier] > TIER_RANK[old.tier] then tipIndex[k] = it end
+      end
+    end
+  end
+  return tipIndex[key]
+end
+
+local function tooltipLines(tip, data)
+  if tipQuiet or not db().tooltips then return end
+  if tip ~= GameTooltip and tip ~= ItemRefTooltip then return end
+  local link
+  if tip.GetItem then
+    local _, l = tip:GetItem()
+    link = l
+  end
+  if not link and type(data) == "table" then
+    link = data.hyperlink or (data.id and ("item:" .. data.id)) or nil
+  end
+  if type(link) ~= "string" then return end
+  local name, _, quality, ilvl, _, _, _, _, invType, _, sellPrice, classID, subID = GetItemInfo(link)
+  if not (name and ilvl and isDisenchantable(classID, subID, quality, invType)) then return end
+  local itemID = tonumber(link:match("item:(%d+)"))
+  local yield, skillNeeded = yieldFor(quality, ilvl)
+  if not yield then return end
+
+  if tipTwoHooks then
+    -- Both hooks may fire for one tooltip; the second finds the lines there.
+    local tipName = tip.GetName and tip:GetName()
+    for i = (tipName and tip:NumLines() or 0), 1, -1 do
+      local fs = _G[tipName .. "TextLeft" .. i]
+      local text = fs and fs:GetText()
+      if type(text) == "string" and text:find("Disenchants into: ", 1, true) then return end
+    end
+  end
+
+  local found = itemID and bagVerdict(itemKey(link, itemID))
+  tip:AddLine(" ")
+  if found then
+    tip:AddLine("In your bags: " .. TIER_TEXT[found.tier]
+      .. (found.reason and (" |cff999999— " .. found.reason .. "|r") or ""), 1, 1, 1, true)
+  end
+  tip:AddLine("Disenchants into: " .. yield, 0.6, 0.85, 1, true)
+  local skill = enchantingSkill()
+  if skillNeeded and skill and skill < skillNeeded then
+    tip:AddLine(("Needs Enchanting %d (you have %d)"):format(skillNeeded, skill), 1, 0.4, 0.4)
+  end
+  local deValue = expectedDisenchantValue(quality, ilvl)
+  if deValue then
+    local value, src = valueOf(itemID, sellPrice, 1)
+    local versus = ""
+    if value then
+      local diff = deValue - value
+      versus = (" |cff999999(%s%s|cff999999 vs %s)|r"):format(
+        diff >= 0 and "|cff55bb66+" or "|cffff6666-", shortMoney(math.abs(diff)),
+        src == "ah" and "AH" or "vendor")
+    end
+    tip:AddLine("Materials worth about " .. shortMoney(deValue) .. versus, 0.55, 0.85, 1)
+  end
+end
+
+--- A broken tooltip hook would raise an error on every hover, so failures are
+--- reported once and then swallowed.
+local function onTooltipItem(tip, data)
+  local ok, err = pcall(tooltipLines, tip, data)
+  if not ok and not tipWarned then
+    tipWarned = true
+    pr("item tooltips hit an error and were skipped: " .. tostring(err))
+  end
+end
+
+--- Newer clients route item tooltips through TooltipDataProcessor; the older
+--- ones fire OnTooltipSetItem. A client in between could define the first and
+--- still use the second, so hook every path that exists and let tooltipLines
+--- skip a tooltip it has already written to.
+local function hookTooltips()
+  local processor = TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall
+    and Enum and Enum.TooltipDataType and Enum.TooltipDataType.Item
+  local scripts = 0
+  for _, tip in pairs({ GameTooltip, ItemRefTooltip }) do
+    if tip.HookScript and tip.HasScript and tip:HasScript("OnTooltipSetItem") then
+      tip:HookScript("OnTooltipSetItem", onTooltipItem)
+      scripts = scripts + 1
+    end
+  end
+  if processor then
+    TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Item, onTooltipItem)
+  end
+  tipTwoHooks = processor and scripts > 0 or false
+end
+
+--------------------------------------------------------------------------------
+-- Chat report.
+--------------------------------------------------------------------------------
 
 function DE.Report()
   local safe, confirm, blocked = DE.Scan()
@@ -556,6 +744,7 @@ end
 DE.tally = {}
 local lastDE = 0
 local lastDESource -- link of the item the completed cast consumed
+local lastDEOwn    -- the same, but only when this addon started the cast
 local sessionStart = time() -- fallback split marker: since login; see resumeSession
 local AUDIT_MAX = 300
 
@@ -656,10 +845,13 @@ local function noteLoot(msg)
   local n = tonumber(count) or 1
   DE.tally[link] = (DE.tally[link] or 0) + n
   auditAppend(lastDESource, link, n)
+  -- Yields are learned only from casts the window started and followed: the
+  -- audit's fallback source can be a click from long ago.
+  recordYield(lastDEOwn, itemID, n)
   -- A disenchant produces one material loot event. Close the transaction as
   -- soon as that event is accepted so a second personal loot line inside the
   -- old time window can never be attached to the completed cast.
-  lastDE, lastDESource = 0, nil
+  lastDE, lastDESource, lastDEOwn = 0, nil, nil
 end
 
 local pendingTrash
@@ -724,6 +916,43 @@ function DE.Tally()
   end
 end
 
+--- /de yields [clear] — what your own disenchants have produced, per band.
+function DE.Yields(args)
+  local d = db()
+  if (args or ""):lower() == "clear" then
+    d.yields = {}
+    pr("observed yields forgotten — estimates are back on book odds.")
+    DE.Refresh()
+    return
+  end
+  local keys = {}
+  for key in pairs(d.yields) do keys[#keys + 1] = key end
+  if #keys == 0 then
+    pr("no yields recorded yet — they build up as you disenchant from the window.")
+    return
+  end
+  table.sort(keys)
+  pr(("your disenchant results (estimates use them from %d of a kind):"):format(YIELD_MIN))
+  for _, key in ipairs(keys) do
+    local seen = d.yields[key]
+    local quality, top = math.floor(key / 1000), key % 1000
+    local low = 1
+    for _, band in ipairs(BANDS[quality] or {}) do
+      if band[1] < top then low = band[1] + 1 end
+    end
+    local parts = {}
+    for id, m in pairs(seen.mats) do
+      parts[#parts + 1] = { id = id, text = ("%s %d%% (avg %.1f)"):format(
+        (GetItemInfo(id)) or ("#" .. id), math.floor(m.h / seen.n * 100 + 0.5), m.q / m.h) }
+    end
+    table.sort(parts, function(a, b) return a.id < b.id end)
+    for i, part in ipairs(parts) do parts[i] = part.text end
+    print(("    %s%s|r i%d-%d |cff888888(%d)|r  %s"):format(qcolor(quality),
+      QUALITY_NAME[quality] or "?", low, top, seen.n, table.concat(parts, ", ")))
+  end
+  print("    |cff888888/de yields clear forgets them.|r")
+end
+
 --- /de audit [n]  — the last n audit entries (default 20); /de audit clear.
 function DE.Audit(args)
   local d = db()
@@ -773,6 +1002,21 @@ local function runTotals(since)
   return totals, order, drops
 end
 
+--- What a run's materials would fetch at today's market prices.
+--- @return copper (nil when nothing is priced), and whether every material was
+local function runValue(totals, order)
+  local sum, priced = 0, 0
+  for _, out in ipairs(order) do
+    local price = marketPrice(tonumber(out:match("item:(%d+)")))
+    if price and price > 0 then
+      sum = sum + price * totals[out]
+      priced = priced + 1
+    end
+  end
+  if priced == 0 then return nil end
+  return sum, priced == #order
+end
+
 --- The group roster this moment — the loot master adjudicates mid-run leavers.
 local function roster()
   local members = {}
@@ -809,6 +1053,10 @@ local function archiveCurrentRun(name)
   for _, out in ipairs(order) do
     saved.totals[#saved.totals + 1] = { out = out, n = totals[out] }
   end
+  -- Worth at the moment it was archived; prices will have moved by the time
+  -- anyone reads the History tab.
+  local worth = runValue(totals, order)
+  saved.value = worth and math.floor(worth + 0.5) or nil
   d.runs[#d.runs + 1] = saved
   while #d.runs > RUN_HISTORY_MAX do table.remove(d.runs, 1) end
   return true
@@ -909,6 +1157,12 @@ function DE.Split(args)
       lines[#lines + 1] = ("%s x%d"):format(out, total)
     end
   end
+  local worth, complete = runValue(totals, order)
+  if worth then
+    lines[#lines + 1] = ("Estimated value: %s%s%s"):format(plainMoney(worth),
+      k > 1 and (" — about %s each"):format(plainMoney(worth / k)) or "",
+      complete and "" or " (some materials unpriced)")
+  end
 
   if channel then
     for _, line in ipairs(lines) do SendChatMessage(line, channel) end
@@ -954,7 +1208,7 @@ local function tipHide() GameTooltip:Hide() end
 local win
 local pendingToggle, pendingTab, pendingShow = false, nil, false
 local WIN_W, WIN_H = 410, 460
-local MIN_W, MIN_H = 360, 420 -- tall enough for the fixed options drawer
+local MIN_W, MIN_H = 380, 420 -- wide enough for the footer: buttons, filter, Next
 local MAX_W, MAX_H = 620, 760
 local ROW_W  = 372 -- initial width; resized rows are anchored to both edges
 local ROW_H  = 28
@@ -1027,7 +1281,7 @@ end
 ---   "macro" (default) — a `/cast Disenchant` macrotext.
 ---   "spell"           — the `spell` attribute. Kept in case a patch breaks
 ---     macrotext.
-local function arm(row, tier, bag, slot)
+local function arm(row, tier, bag, slot, outOfCombatOnly)
   setAction(row, "", nil, nil, nil, nil)
   setAction(row, "ctrl-", nil, nil, nil, nil)
   row.cancelCast = nil
@@ -1036,7 +1290,10 @@ local function arm(row, tier, bag, slot)
   if not (bag and slot and tier ~= "blocked") then return end
   local prefix = (tier == "safe") and "" or "ctrl-"
   if db().clickMode == "macro" then
-    setAction(row, prefix, "macro", "/cast " .. deName(), bag, slot)
+    -- `outOfCombatOnly` is for the Next button: attributes can't be cleared
+    -- once lockdown starts, so its macro carries the refusal with it.
+    setAction(row, prefix, "macro",
+      "/cast " .. (outOfCombatOnly and "[nocombat] " or "") .. deName(), bag, slot)
   else
     setAction(row, prefix, "spell", deName(), bag, slot)
   end
@@ -1062,11 +1319,13 @@ local function armTrash(row, tier, bag, slot)
   if tier ~= "blocked" then row.trashBag, row.trashSlot = bag, slot end
 end
 
---- Disarm every row right now. Called the instant bags change, so a row can
---- never fire at whatever slid into its slot before the rebuild lands.
+--- Disarm every row, and the Next button, right now. Called the instant bags
+--- change, so nothing can fire at whatever slid into a slot before the
+--- rebuild lands.
 local function disarmAll()
   if not win or InCombatLockdown() then return end
   for _, row in ipairs(win.rows) do arm(row, "blocked") end
+  if win.next then arm(win.next, "blocked"); win.next.item = nil end
 end
 
 -- Row order is held while the window stays open, so a rebuild never slides a
@@ -1094,6 +1353,151 @@ local function holdOrder(tab, ...)
   end
 end
 
+--------------------------------------------------------------------------------
+-- Small building blocks shared by every tab.
+--------------------------------------------------------------------------------
+local function simpleTip(frame, title, body, anchor)
+  frame:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, anchor or "ANCHOR_RIGHT")
+    GameTooltip:SetText(title, 1, 1, 1)
+    if body then GameTooltip:AddLine(body, 0.6, 0.6, 0.6, true) end
+    GameTooltip:Show()
+  end)
+  frame:SetScript("OnLeave", tipHide)
+end
+
+--- A flat button drawn to match the tabs, instead of Blizzard's red panel
+--- button. A real Button with a font string, so SetText / SetEnabled behave.
+local function flatButton(parent, label, w, h)
+  local b = CreateFrame("Button", nil, parent)
+  b:SetSize(w, h or 22)
+  b.edge = b:CreateTexture(nil, "BACKGROUND")
+  b.edge:SetAllPoints()
+  b.edge:SetColorTexture(0.26, 0.28, 0.33, 1)
+  b.bg = b:CreateTexture(nil, "BORDER")
+  b.bg:SetPoint("TOPLEFT", 1, -1)
+  b.bg:SetPoint("BOTTOMRIGHT", -1, 1)
+  b.bg:SetColorTexture(0.11, 0.12, 0.15, 1)
+  local hover = b:CreateTexture(nil, "HIGHLIGHT")
+  hover:SetAllPoints(b.bg)
+  hover:SetColorTexture(1, 1, 1, 0.09)
+  b.text = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  b.text:SetPoint("CENTER", 0, 0)
+  b:SetFontString(b.text)
+  b:SetNormalFontObject("GameFontHighlightSmall")
+  b:SetDisabledFontObject("GameFontDisableSmall")
+  b:SetText(label)
+  return b
+end
+
+--------------------------------------------------------------------------------
+-- The Next button and its key. One secure button, parked in the footer where
+-- it never moves, always pointed at the top row of "Safe to disenchant" — the
+-- same item, the same macro and the same target-bag/-slot as that row. A key
+-- can be bound to it, but only as an override binding that exists while the
+-- window is open on the Disenchant tab: close the window and the key is its
+-- old self again. Still one hardware event per cast, and never a Check first
+-- or Protected item — those keep their Ctrl-click and their dead rows.
+--------------------------------------------------------------------------------
+local KEY_SHORT = {
+  MOUSEWHEELUP = "Wheel Up", MOUSEWHEELDOWN = "Wheel Down",
+  BUTTON3 = "Mouse 3", BUTTON4 = "Mouse 4", BUTTON5 = "Mouse 5",
+}
+-- BUTTON1/2 are the mouse itself: an override on the right button leaves the
+-- 1.60 client's cursor hidden until restart. Escape and Enter belong to the UI.
+local BAD_KEY = { BUTTON1 = true, BUTTON2 = true, ESCAPE = true, ENTER = true, UNKNOWN = true }
+
+-- The button has room for a short badge only; anything long is left to the
+-- tooltip and Settings.
+local KEY_BADGE = {
+  MOUSEWHEELUP = "WhlUp", MOUSEWHEELDOWN = "WhlDn",
+  BUTTON3 = "M3", BUTTON4 = "M4", BUTTON5 = "M5",
+}
+
+local function keyLabel(key) return key and (KEY_SHORT[key] or key) or nil end
+
+local keyDirty = false
+local function applyNextKey()
+  if not win then return end
+  -- Bindings can't change in combat; PLAYER_REGEN_ENABLED comes back here.
+  if InCombatLockdown() then keyDirty = true return end
+  keyDirty = false
+  if ClearOverrideBindings then ClearOverrideBindings(win) end
+  local key = db().nextKey
+  -- IsVisible, not IsShown: with the whole UI hidden (Alt-Z, a cinematic) the
+  -- window still counts as shown, and a key that disenchants unseen items is
+  -- exactly what this must never be.
+  if key and SetOverrideBindingClick and win:IsVisible() and win.tab == "de" then
+    SetOverrideBindingClick(win, true, key, "DisenchanterNextButton", "LeftButton")
+  end
+end
+
+--- Point the Next button at an item, or at nothing. Anything but the
+--- Disenchant tab of a visible window gets nothing.
+local function syncNext(it)
+  local nb = win and win.next
+  if not nb or InCombatLockdown() then return end -- SetAttribute / Show are protected
+  nb:SetShown(win.tab == "de")
+  if not (win:IsVisible() and win.tab == "de") then it = nil end
+  nb.item = it
+  if it then arm(nb, "safe", it.bag, it.slot, true) else arm(nb, "blocked") end
+  local key = KEY_BADGE[db().nextKey or ""] or db().nextKey
+  local label
+  if it then
+    label = "Disenchant next" .. ((key and #key <= 6) and ("  |cffd9c2f5[" .. key .. "]|r") or "")
+  elseif DE.cast then
+    label = "Disenchanting..."
+  elseif not knowsDisenchant() then
+    label = "Can't disenchant"
+  else
+    label = "Nothing safe"
+  end
+  nb.text:SetText(label)
+  nb.text:SetTextColor(it and 1 or 0.5, it and 1 or 0.5, it and 1 or 0.52)
+  nb.bg:SetColorTexture(it and 0.34 or 0.11, it and 0.15 or 0.12, it and 0.50 or 0.15, 1)
+  nb.edge:SetColorTexture(it and 0.62 or 0.26, it and 0.36 or 0.28, it and 0.86 or 0.33, 1)
+end
+
+--- /de key, and the Settings key button. `key` is a single key name with no
+--- modifier: the Next button only carries a plain-click action, so a
+--- modified press would find nothing to do.
+function DE.SetNextKey(key)
+  key = tostring(key or ""):upper()
+  key = key:gsub("%s+", "")
+  if key == "" or key == "NONE" or key == "OFF" or key == "CLEAR" then
+    db().nextKey = nil
+    pr("next-item key cleared.")
+  elseif BAD_KEY[key] or (#key > 1 and key:find("-", 1, true)) then
+    pr(("|cffffd100%s|r can't be the next-item key — use one key with no modifier, or the mouse wheel / buttons 3-5."):format(key))
+    return
+  else
+    db().nextKey = key
+    pr(("next-item key is |cffffd100%s|r: while the window is on the Disenchant tab it disenchants the top Safe row."):format(keyLabel(key)))
+  end
+  applyNextKey()
+  DE.Refresh()
+end
+
+--- Switch this character between the account's guard settings and its own.
+--- The first switch starts from a copy of the account's, so nothing changes
+--- at the moment of switching; later ones return to what the character had.
+function DE.SetCharSettings(on)
+  local c, d = DB.GetChar(GUARDS), db()
+  if on and type(c.guards) ~= "table" then
+    c.guards = {}
+    for key, value in pairs(d.guards) do c.guards[key] = value end
+    c.confirmAbove, c.valueGold, c.ilvlCap, c.lossSilver = d.confirmAbove, d.valueGold, d.ilvlCap, d.lossSilver
+  end
+  c.own = on and true or false
+  if c.own then DB.RepairSettings(c, GUARDS) end
+  pr(c.own and "this character now has its own guards and thresholds. The keep list is still shared."
+    or "this character is back on the account's guards and thresholds.")
+  DE.Refresh()
+end
+
+--------------------------------------------------------------------------------
+-- Rows.
+--------------------------------------------------------------------------------
 local function headerRow(i)
   local row = win.heads[i]
   if row then return row end
@@ -1107,8 +1511,15 @@ local function headerRow(i)
   row.toggle = row:CreateTexture(nil, "ARTWORK")
   row.toggle:SetSize(14, 14)
   row.toggle:SetPoint("LEFT", 0, 0)
+  -- What the section adds up to, where there is something to add up.
+  row.right = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  row.right:SetPoint("RIGHT", -6, 0)
+  -- The title gives way to it: a long run name truncates instead of colliding.
   row.text = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   row.text:SetPoint("LEFT", row.toggle, "RIGHT", 4, 0)
+  row.text:SetPoint("RIGHT", row.right, "LEFT", -6, 0)
+  row.text:SetJustifyH("LEFT")
+  row.text:SetWordWrap(false)
   row:SetScript("OnClick", function(self)
     local col = db().collapsed
     col[self.key] = not col[self.key]
@@ -1116,6 +1527,58 @@ local function headerRow(i)
   end)
   win.heads[i] = row
   return row
+end
+
+local function placeHead(hi, y, key, text, right)
+  local head = headerRow(hi)
+  head.key = key
+  head.toggle:SetTexture(isCollapsed(key) and PLUS or MINUS)
+  head.text:SetText(text)
+  head.right:SetText(right or "")
+  head:ClearAllPoints()
+  head:SetPoint("TOPLEFT", 0, y)
+  head:SetPoint("TOPRIGHT", 0, y)
+  head:Show()
+  return y - HEAD_H
+end
+
+-- PreClick can't cancel a secure action, but it can tell us what we were
+-- aiming at — which is what turns "Item cannot be disenchanted" into a
+-- permanent note against that item id, and what the cast bar follows. Shared
+-- by the rows and the Next button.
+local function notePending(self, button)
+  local it = self.item
+  if DE.trace then
+    pr(("PRE  button=%s ctrl=%s item=%s tier=%s type=%s"):format(
+      tostring(button), tostring(IsControlKeyDown()),
+      it and it.link or "nil", it and it.tier or "nil",
+      tostring(self:GetAttribute("type"))))
+  end
+  if self.cancelCast or not (it and it.bag) then return end
+  local now = C.GetContainerItemInfo(it.bag, it.slot)
+  DE._pending = (now and now.itemID == it.itemID) and it or nil
+  DE._pendingAt = GetTime()
+end
+
+local TEXT_LEFT = 34   -- past the icon
+local LOCK_PAD  = 26   -- the padlock and its margins
+local VALUE_COL = 72   -- the right-hand figure column, when a row has one
+
+--- Lay out a row's text against whatever sits on its right: `pad` is the
+--- width taken by the padlock / Allow button, `column` whether the value
+--- column is in use. Regions only — safe to call on a secure row.
+local function rowInsets(row, pad, column)
+  row.value:ClearAllPoints()
+  row.value:SetPoint("TOPRIGHT", -pad, -4)
+  row.tag:ClearAllPoints()
+  row.tag:SetPoint("TOPRIGHT", -pad, -16)
+  local inset = pad + (column and VALUE_COL or 0) + 4
+  row.name:ClearAllPoints()
+  row.name:SetPoint("TOPLEFT", TEXT_LEFT, -4)
+  row.name:SetPoint("TOPRIGHT", -inset, -4)
+  row.note:ClearAllPoints()
+  row.note:SetPoint("TOPLEFT", TEXT_LEFT, -16)
+  row.note:SetPoint("TOPRIGHT", -inset, -16)
 end
 
 local function itemRow(i)
@@ -1175,10 +1638,8 @@ local function itemRow(i)
   end)
   row.lock:SetScript("OnLeave", tipHide)
 
-  row.allow = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-  row.allow:SetSize(46, 18)
+  row.allow = flatButton(row, "Allow", 46, 18)
   row.allow:SetPoint("RIGHT", row.lock, "LEFT", -3, 0)
-  row.allow:SetText("Allow")
   row.allow:SetScript("OnClick", function(self)
     local it = self:GetParent().item
     if not it then return end
@@ -1205,17 +1666,19 @@ local function itemRow(i)
   end)
   row.allow:SetScript("OnLeave", tipHide)
 
+  -- Two lines of text on the left, and a figure column on the right: what the
+  -- row is worth on top, and under it the "next" marker for the Next button.
   row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  row.name:SetPoint("TOPLEFT", row.icon, "TOPRIGHT", 5, -1)
-  row.name:SetPoint("RIGHT", row.allow, "LEFT", -4, 0)
   row.name:SetJustifyH("LEFT")
   row.name:SetWordWrap(false)
-
   row.note = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  row.note:SetPoint("TOPLEFT", row.name, "BOTTOMLEFT", 0, -1)
-  row.note:SetPoint("RIGHT", row.allow, "LEFT", -4, 0)
   row.note:SetJustifyH("LEFT")
   row.note:SetWordWrap(false)
+  row.value = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  row.value:SetJustifyH("RIGHT")
+  row.tag = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  row.tag:SetJustifyH("RIGHT")
+  rowInsets(row, LOCK_PAD, false)
 
   row:SetScript("OnEnter", function(self)
     local it = self.item
@@ -1231,7 +1694,10 @@ local function itemRow(i)
       return
     end
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+    -- This tooltip says everything the item-tooltip hook would, and more.
+    tipQuiet = true
     GameTooltip:SetBagItem(it.bag, it.slot)
+    tipQuiet = false
     GameTooltip:AddLine(" ")
     GameTooltip:AddLine(("Bag %d, slot %d"):format(it.bag, it.slot), 0.55, 0.55, 0.55)
     if it.yield then GameTooltip:AddLine("Disenchants into: " .. it.yield, 0.6, 0.85, 1, true) end
@@ -1241,7 +1707,10 @@ local function itemRow(i)
     end
     if it.deValue then
       GameTooltip:AddLine(("Estimated disenchant value: %s"):format(money(it.deValue)), 0.55, 0.85, 1)
-      GameTooltip:AddLine("Uses current Auctionator/TSM material prices and approximate drop odds.", 0.55, 0.55, 0.55, true)
+      GameTooltip:AddLine(it.deSeen
+        and ("Based on your own %d disenchants of this kind, at current Auctionator/TSM prices."):format(it.deSeen)
+        or "Uses current Auctionator/TSM material prices and approximate drop odds.",
+        0.55, 0.55, 0.55, true)
     end
     if it.casting then
       GameTooltip:AddLine("Click again to cancel this disenchant.", 0.75, 0.5, 1)
@@ -1266,22 +1735,7 @@ local function itemRow(i)
   end)
   row:SetScript("OnLeave", tipHide)
 
-  -- PreClick can't cancel a secure action, but it can tell us what we were
-  -- aiming at — which is what turns "Item cannot be disenchanted" into a
-  -- permanent note against that item id.
-  row:SetScript("PreClick", function(self, button)
-    local it = self.item
-    if DE.trace then
-      pr(("PRE  button=%s ctrl=%s item=%s tier=%s type=%s"):format(
-        tostring(button), tostring(IsControlKeyDown()),
-        it and it.link or "nil", it and it.tier or "nil",
-        tostring(self:GetAttribute("type"))))
-    end
-    if self.cancelCast or not (it and it.bag) then return end
-    local now = C.GetContainerItemInfo(it.bag, it.slot)
-    DE._pending = (now and now.itemID == it.itemID) and it or nil
-    DE._pendingAt = GetTime()
-  end)
+  row:SetScript("PreClick", notePending)
 
   -- PostClick runs straight after the secure handler. The Trash tab's delete
   -- lives here; the disenchant tab has nothing left to do by this point — the
@@ -1326,32 +1780,76 @@ local function itemRow(i)
   return row
 end
 
+local function iconOf(link)
+  if not (link and GetItemInfoInstant) then return nil end
+  local ok, icon = pcall(function() return select(5, GetItemInfoInstant(link)) end)
+  return ok and icon or nil
+end
+
+--- A read-only row for the Run Split and History tabs: an icon, two lines and
+--- an optional figure. Never armed.
+local function placeInfo(ri, y, tint, link, nameText, noteText, valueText, icon)
+  local row = itemRow(ri)
+  row.item = { run = true, runLink = link }
+  row.bg:SetColorTexture(0.055, 0.06, 0.07, ri % 2 == 0 and 0.88 or 0.72)
+  row.state:SetColorTexture(tint[1], tint[2], tint[3], 0.85)
+  row.icon:SetTexture(icon or iconOf(link) or FALLBACK_ICON)
+  row.icon:SetDesaturated(false)
+  row.name:SetText(nameText)
+  row.note:SetText(noteText or "")
+  row.value:SetText(valueText or "")
+  row.tag:SetText("")
+  rowInsets(row, 6, (valueText or "") ~= "")
+  row.castFill:Hide()
+  row.lock:Hide()
+  row.allow:Hide()
+  arm(row, "blocked")
+  row:ClearAllPoints()
+  row:SetPoint("TOPLEFT", 0, y)
+  row:SetPoint("TOPRIGHT", 0, y)
+  row:Show()
+  return y - ROW_H
+end
+
+--- Hide and disarm whatever a shorter list no longer uses.
+local function hideRest(hi, ri)
+  for i = hi + 1, #win.heads do win.heads[i]:Hide() end
+  for i = ri + 1, #win.rows do
+    arm(win.rows[i], "blocked")
+    win.rows[i].item = nil
+    win.rows[i]:Hide()
+  end
+end
+
 local function statusText(safe, confirm, blocked)
   if InCombatLockdown() then
-    return "|cffff5555In combat|r — the list is frozen until you're out."
-  end
-  -- The trash tab needs no profession at all, so its branch comes before the
-  -- "you don't know Disenchant" complaint.
-  if win and win.tab == "trash" then
-    local n = #safe + #confirm
-    return ("|cff33cc44%d junk|r, |cffffd100%d to check|r, |cffff5555%d protected|r%s")
-      :format(#safe, #confirm, #blocked,
-        n > 0 and ("   |cff888888%d bag slot%s to reclaim|r"):format(n, n == 1 and "" or "s") or "")
-  end
-  if not knowsDisenchant() then
-    return "|cffff5555You don't know Disenchant.|r Rows are listed but nothing will cast."
+    return "|cffff5555In combat|r — the list is frozen until you leave it."
   end
   local skill = enchantingSkill()
+  if not knowsDisenchant() then
+    return ("|cff33cc44%d safe|r, |cffffd100%d to check|r, |cffff5555%d protected|r   |cffff5555no Disenchant on this character|r")
+      :format(#safe, #confirm, #blocked)
+  end
   return ("|cff33cc44%d safe|r, |cffffd100%d to check|r, |cffff5555%d protected|r%s")
     :format(#safe, #confirm, #blocked, skill and ("   |cff888888Enchanting " .. skill .. "|r") or "")
 end
 
+local function profitText(profit)
+  if not profit then return "" end
+  return (profit >= 0 and "|cff55bb66+" or "|cffff6666-") .. shortMoney(math.abs(profit)) .. "|r"
+end
+
 function DE.Refresh()
-  if not (win and win:IsShown()) then return end
+  tipIndex = nil -- whatever prompted this may have changed a verdict
+  -- Visible, not just shown: nothing is armed while the UI itself is hidden.
+  -- OnShow redraws when it comes back.
+  if not (win and win:IsVisible()) then return end
   if win.tab == "options" then
     DE.RefreshOptions()
-    win.status:SetText("Settings")
+    win.status:SetText("Settings" .. (DB.GetChar(GUARDS).own
+      and "   |cff888888this character's own guards|r" or ""))
     win.hint:SetText("Choose what is protected and what requires confirmation.")
+    syncNext(nil)
     return
   end
   if InCombatLockdown() then
@@ -1360,8 +1858,8 @@ function DE.Refresh()
     return -- SetAttribute is forbidden in combat; PLAYER_REGEN_ENABLED redraws
   end
   win.content:SetAlpha(1)
-  if win.tab == "split" then return DE.RefreshSplit() end
-  if win.tab == "history" then return DE.RefreshHistory() end
+  if win.tab == "split" then syncNext(nil); return DE.RefreshSplit() end
+  if win.tab == "history" then syncNext(nil); return DE.RefreshHistory() end
   local trash = win.tab == "trash"
   local safe, confirm, blocked
   if trash then
@@ -1395,20 +1893,21 @@ function DE.Refresh()
   -- Without Disenchant a row has nothing safe to do: leave it unarmed rather
   -- than let a click raise "You don't know that spell" against the item.
   local canCast = trash or knowsDisenchant()
+  -- What the Next button fires: the top Safe row, when it is on screen and
+  -- nothing is mid-cast. What you can't see, the button can't touch.
+  local nextIt = (not trash and canCast and not DE.cast and not isCollapsed("safe"))
+    and safe[1] or nil
   local hi, ri, y = 0, 0, 0
   for _, b in ipairs(trash and TRASH_BUCKETS or BUCKETS) do
     local list = lists[b.key]
     local ck = b.col or b.key
+    local sum = 0
+    if b.key ~= "blocked" then
+      for _, it in ipairs(list) do sum = sum + ((trash and it.vendor or it.deValue) or 0) end
+    end
     hi = hi + 1
-    local head = headerRow(hi)
-    head.key = ck
-    head.toggle:SetTexture(isCollapsed(ck) and PLUS or MINUS)
-    head.text:SetText(("%s%s|r  |cff888888(%d)|r"):format(b.color, b.title, #list))
-    head:ClearAllPoints()
-    head:SetPoint("TOPLEFT", 0, y)
-    head:SetPoint("TOPRIGHT", 0, y)
-    head:Show()
-    y = y - HEAD_H
+    y = placeHead(hi, y, ck, ("%s%s|r  |cff888888(%d)|r"):format(b.color, b.title, #list),
+      sum > 0 and ((trash and "forfeits " or "materials ~") .. shortMoney(sum)) or "")
 
     if not isCollapsed(ck) then
       for _, it in ipairs(list) do
@@ -1425,41 +1924,51 @@ function DE.Refresh()
         end
         row.icon:SetTexture(it.icon or FALLBACK_ICON)
         row.icon:SetDesaturated(it.tier == "blocked")
+
+        local figure = ""
         if trash then
-          -- Vendor value where the disenchant tab shows ilvl — it's the sort
-          -- key, and it's what deleting the row costs you.
-          row.name:SetText(("%s%s|r%s  |cff888888%s|r"):format(
-            qcolor(it.quality), it.name, it.count > 1 and (" x" .. it.count) or "",
-            (it.vendor > 0 and money(it.vendor) or "worthless")
-              .. (it.valueSrc == "ah" and " · AH-priced" or " · vendor")))
+          -- The figure is the sort key, and what deleting the row costs you.
+          row.name:SetText(("%s%s|r%s"):format(qcolor(it.quality), it.name,
+            it.count > 1 and (" x" .. it.count) or ""))
+          if it.tier ~= "blocked" and it.vendor > 0 then
+            figure = "|cffd0c080" .. shortMoney(it.vendor) .. "|r"
+          end
           if it.tier == "safe" then
-            row.note:SetText("|cff777777click to delete — gone for good|r")
+            row.note:SetText(it.vendor > 0 and "|cff777777click to delete — gone for good|r"
+              or "|cff777777worthless — click to delete|r")
           else
             row.note:SetText((it.tier == "confirm" and "|cffbfa640Ctrl-click: " or "|cffbf5555")
               .. (it.reason or "") .. "|r")
           end
         else
-          row.name:SetText(("%s%s|r%s  |cff888888i%d%s|r"):format(
-            qcolor(it.quality), it.name, it.count > 1 and (" x" .. it.count) or "", it.ilvl,
-            it.valueSrc == "ah" and " · AH" or (it.valueSrc == "vendor" and " · vendor" or "")))
+          row.name:SetText(("%s%s|r%s  |cff888888i%d|r"):format(
+            qcolor(it.quality), it.name, it.count > 1 and (" x" .. it.count) or "", it.ilvl))
+          if it.tier ~= "blocked" then figure = profitText(it.profit) end
           if it.casting then
             row.note:SetText("|cffb37ce8Disenchanting... click again to cancel|r")
           elseif it.tier == "safe" then
-            local profit = it.profit and ((it.profit >= 0 and " · |cff55bb66est. +" or " · |cffff6666est. −")
-              .. money(math.abs(it.profit)) .. "|r") or ""
-            row.note:SetText("|cff777777" .. (it.yield or "") .. "|r" .. profit)
+            row.note:SetText("|cff777777" .. (it.yield or "") .. "|r")
           else
             row.note:SetText((it.tier == "confirm" and "|cffbfa640Ctrl-click: " or "|cffbf5555")
               .. (it.reason or "") .. "|r")
           end
         end
+        local tag = (it == nextIt) and "|cffb37ce8next|r" or ""
+        row.value:SetText(figure)
+        row.tag:SetText(tag)
+
         row.castFill:SetShown(it.casting and true or false)
         if it.casting then win.castingRow = row end
         row.lock:Show() -- the Run Split and History tabs hide it
         row.lock:SetNormalTexture(keptAs(it) and LOCKED or UNLOCKED)
-        row.allow:SetText(allowed[keyOf(it)] and "Restore" or "Allow")
-        row.allow:SetWidth(allowed[keyOf(it)] and 54 or 46)
-        row.allow:SetShown((it.tier == "blocked" and not it.permanent) or allowed[keyOf(it)])
+        local override = allowed[keyOf(it)]
+        local showAllow = (it.tier == "blocked" and not it.permanent) or override
+        local allowW = override and 54 or 46
+        row.allow:SetText(override and "Restore" or "Allow")
+        row.allow:SetWidth(allowW)
+        row.allow:SetShown(showAllow and true or false)
+        rowInsets(row, LOCK_PAD + (showAllow and (allowW + 5) or 0), figure ~= "" or tag ~= "")
+
         if trash then
           armTrash(row, it.tier, it.bag, it.slot)
         else
@@ -1477,15 +1986,11 @@ function DE.Refresh()
       end
     end
   end
-  for i = hi + 1, #win.heads do win.heads[i]:Hide() end
-  for i = ri + 1, #win.rows do
-    arm(win.rows[i], "blocked")
-    win.rows[i].item = nil
-    win.rows[i]:Hide()
-  end
+  hideRest(hi, ri)
   win.content:SetHeight(math.max(-y, 1))
   win.empty:SetShown(#safe + #confirm + #blocked == 0)
   win.status:SetText(statusText(safe, confirm, blocked))
+  syncNext(nextIt)
   if win.opts and win.opts:IsShown() then DE.RefreshOptions() end
   -- The broker always shows disenchant counts; on the trash tab it rescans.
   if trash or filterText ~= "" then DE.UpdateBroker() else DE.UpdateBroker(#safe, #confirm) end
@@ -1505,12 +2010,8 @@ end
 -- appear — the numbers come from the audit log, not from your bags.
 --------------------------------------------------------------------------------
 local RUN_LOG_MAX = 40 -- rows drawn; the header still counts everything
-
-local function iconOf(link)
-  if not (link and GetItemInfoInstant) then return nil end
-  local ok, icon = pcall(function() return select(5, GetItemInfoInstant(link)) end)
-  return ok and icon or nil
-end
+local SPLIT_TINT, HISTORY_TINT = { 0.32, 0.48, 0.68 }, { 0.50, 0.36, 0.65 }
+local NOTE_ICON = "Interface\\Icons\\INV_Misc_Note_01"
 
 function DE.RefreshSplit()
   local d = db()
@@ -1519,50 +2020,22 @@ function DE.RefreshSplit()
   local totals, order, drops = runTotals(since)
   local members = roster()
   local k = #members
+  local worth, complete = runValue(totals, order)
 
   win.hint:SetText("Counts from the run marker — earlier shards never appear.")
   win.empty:SetText("Nothing disenchanted since " .. sinceLabel)
   win.castingRow = nil
   win.announce:SetEnabled(k > 1)
 
-  local hi, ri, y = 0, 0, 0
-  local function head(key, text)
-    hi = hi + 1
-    local h = headerRow(hi)
-    h.key = key
-    h.toggle:SetTexture(isCollapsed(key) and PLUS or MINUS)
-    h.text:SetText(text)
-    h:ClearAllPoints()
-    h:SetPoint("TOPLEFT", 0, y)
-    h:SetPoint("TOPRIGHT", 0, y)
-    h:Show()
-    y = y - HEAD_H
-  end
-  local function line(link, nameText, noteText)
-    ri = ri + 1
-    local row = itemRow(ri)
-    row.item = { run = true, runLink = link }
-    row.bg:SetColorTexture(0.055, 0.06, 0.07, ri % 2 == 0 and 0.88 or 0.72)
-    row.state:SetColorTexture(0.32, 0.48, 0.68, 0.85)
-    row.icon:SetTexture(iconOf(link) or FALLBACK_ICON)
-    row.icon:SetDesaturated(false)
-    row.name:SetText(nameText)
-    row.note:SetText(noteText or "")
-    row.castFill:Hide()
-    row.lock:Hide()
-    row.allow:Hide()
-    arm(row, "blocked")
-    row:ClearAllPoints()
-    row:SetPoint("TOPLEFT", 0, y)
-    row:SetPoint("TOPRIGHT", 0, y)
-    row:Show()
-    y = y - ROW_H
-  end
-
-  head("runmats", ("|cff33cc44Materials this run|r  |cff888888(%d)|r"):format(#order))
+  local hi, ri, y = 1, 0, 0
+  y = placeHead(hi, y, "runmats",
+    ("|cff33cc44MATERIALS THIS RUN|r  |cff888888(%d)|r"):format(#order),
+    worth and ("worth ~" .. shortMoney(worth) .. (complete and "" or "+")) or "")
   if not isCollapsed("runmats") then
     for _, out in ipairs(order) do
       local total = totals[out]
+      local price = marketPrice(tonumber(out:match("item:(%d+)")))
+      if price and price <= 0 then price = nil end
       local share
       if k > 1 then
         local each, spare = math.floor(total / k), total % k
@@ -1571,7 +2044,9 @@ function DE.RefreshSplit()
       else
         share = "not in a group — totals only"
       end
-      line(out, ("%s |cffffffffx%d|r"):format(out, total), "|cff777777" .. share .. "|r")
+      ri = ri + 1
+      y = placeInfo(ri, y, SPLIT_TINT, out, ("%s |cffffffffx%d|r"):format(out, total),
+        "|cff777777" .. share .. "|r", price and shortMoney(price * total) or "")
     end
   end
 
@@ -1580,7 +2055,8 @@ function DE.RefreshSplit()
   for i = #d.audit, 1, -1 do
     if d.audit[i].t >= since then log[#log + 1] = d.audit[i] end
   end
-  head("runlog", ("|cffffd100Log|r  |cff888888(%d, newest first)|r"):format(#log))
+  hi = hi + 1
+  y = placeHead(hi, y, "runlog", ("|cffffd100LOG|r  |cff888888(%d, newest first)|r"):format(#log))
   if not isCollapsed("runlog") then
     for i = 1, math.min(#log, RUN_LOG_MAX) do
       local e = log[i]
@@ -1593,32 +2069,33 @@ function DE.RefreshSplit()
         what = (e.src and (e.src .. " |cff888888>|r ") or "") .. e.out
           .. (e.n > 1 and (" |cffffffffx" .. e.n .. "|r") or "")
       end
-      line(e.del and e.src or e.out, what,
+      ri = ri + 1
+      y = placeInfo(ri, y, SPLIT_TINT, e.del and e.src or e.out, what,
         ("|cff777777%s   %s%s|r"):format(date("%H:%M", e.t), e.zone or "?",
           e.grp and ("  —  group of " .. e.grp) or ""))
     end
     if #log > RUN_LOG_MAX then
-      line(nil, ("|cff888888… and %d earlier — /de audit %d shows them all|r")
-        :format(#log - RUN_LOG_MAX, #log), "")
+      ri = ri + 1
+      y = placeInfo(ri, y, SPLIT_TINT, nil, ("|cff888888… and %d earlier — /de audit %d shows them all|r")
+        :format(#log - RUN_LOG_MAX, #log), "", nil, NOTE_ICON)
     end
   end
 
-  for i = hi + 1, #win.heads do win.heads[i]:Hide() end
-  for i = ri + 1, #win.rows do
-    arm(win.rows[i], "blocked")
-    win.rows[i].item = nil
-    win.rows[i]:Hide()
-  end
+  hideRest(hi, ri)
   win.content:SetHeight(math.max(-y, 1))
   win.empty:SetShown(#log == 0)
+  local split = "   |cff888888not in a group|r"
+  if k > 1 then
+    split = (" — |cff33cc44split %d ways|r%s"):format(k,
+      worth and (", ~" .. shortMoney(worth / k) .. " each") or "")
+  end
   win.status:SetText(("Run since |cffffd100%s|r — %d drop%s%s"):format(sinceLabel,
-    drops, drops == 1 and "" or "s",
-    k > 1 and (" — |cff33cc44split %d ways|r"):format(k) or "   |cff888888not in a group|r"))
+    drops, drops == 1 and "" or "s", split))
   DE.UpdateBroker()
 end
 
 -- Archived runs are deliberately separate from the live split inventory. Each
--- run expands to its material totals and the roster captured when it ended.
+-- run expands to its roster and its material totals.
 function DE.RefreshHistory()
   local d = db()
   win.hint:SetText("Archived runs — expand one to inspect its materials and roster.")
@@ -1627,60 +2104,35 @@ function DE.RefreshHistory()
   win.castingRow = nil
 
   local hi, ri, y = 0, 0, 0
-  local function head(key, text)
-    hi = hi + 1
-    local h = headerRow(hi)
-    h.key = key
-    h.toggle:SetTexture(isCollapsed(key) and PLUS or MINUS)
-    h.text:SetText(text)
-    h:ClearAllPoints()
-    h:SetPoint("TOPLEFT", 0, y)
-    h:SetPoint("TOPRIGHT", 0, y)
-    h:Show()
-    y = y - HEAD_H
-  end
-  local function line(link, nameText, noteText)
-    ri = ri + 1
-    local row = itemRow(ri)
-    row.item = { run = true, runLink = link }
-    row.bg:SetColorTexture(0.055, 0.06, 0.07, ri % 2 == 0 and 0.88 or 0.72)
-    row.state:SetColorTexture(0.50, 0.36, 0.65, 0.85)
-    row.icon:SetTexture(iconOf(link) or FALLBACK_ICON)
-    row.icon:SetDesaturated(false)
-    row.name:SetText(nameText)
-    row.note:SetText(noteText or "")
-    row.castFill:Hide()
-    row.lock:Hide()
-    row.allow:Hide()
-    arm(row, "blocked")
-    row:ClearAllPoints()
-    row:SetPoint("TOPLEFT", 0, y)
-    row:SetPoint("TOPRIGHT", 0, y)
-    row:Show()
-    y = y - ROW_H
-  end
-
   for i = #d.runs, 1, -1 do
     local run = d.runs[i]
     local key = "history" .. tostring(run.start or i)
-    head(key, ("|cffb37ce8%s|r  |cff888888%s — %d drop%s|r"):format(
+    hi = hi + 1
+    y = placeHead(hi, y, key, ("|cffb37ce8%s|r  |cff888888%s — %d drop%s|r"):format(
       run.name or "Run", date("%d %b %Y %H:%M", run.start), run.drops or 0,
-      run.drops == 1 and "" or "s"))
+      run.drops == 1 and "" or "s"),
+      type(run.value) == "number" and ("was ~" .. shortMoney(run.value)) or "")
     if not isCollapsed(key) then
-      local names = table.concat(run.members or {}, ", ")
+      local members = run.members or {}
+      ri = ri + 1
+      y = placeInfo(ri, y, HISTORY_TINT, nil,
+        #members > 0 and ("Roster |cff888888(%d)|r"):format(#members) or "No roster captured",
+        "|cff777777" .. (#members > 0 and table.concat(members, ", ") or "You weren't in a group when this run ended.") .. "|r",
+        nil, NOTE_ICON)
       for _, material in ipairs(run.totals or {}) do
-        line(material.out, ("%s |cffffffffx%d|r"):format(material.out, material.n or 0),
-          "|cff777777" .. (names ~= "" and names or "No roster captured") .. "|r")
+        local n = material.n or 0
+        local price = marketPrice(tonumber(tostring(material.out):match("item:(%d+)")))
+        if price and price <= 0 then price = nil end
+        ri = ri + 1
+        y = placeInfo(ri, y, HISTORY_TINT, material.out,
+          ("%s |cffffffffx%d|r"):format(material.out, n),
+          price and "|cff777777at today's prices|r" or "",
+          price and shortMoney(price * n) or "")
       end
     end
   end
 
-  for i = hi + 1, #win.heads do win.heads[i]:Hide() end
-  for i = ri + 1, #win.rows do
-    arm(win.rows[i], "blocked")
-    win.rows[i].item = nil
-    win.rows[i]:Hide()
-  end
+  hideRest(hi, ri)
   win.content:SetHeight(math.max(-y, 1))
   win.empty:SetShown(#d.runs == 0)
   win.status:SetText(("|cffb37ce8%d archived run%s|r"):format(#d.runs, #d.runs == 1 and "" or "s"))
@@ -1688,117 +2140,215 @@ function DE.RefreshHistory()
 end
 
 --------------------------------------------------------------------------------
--- Options tab: the guard toggles and the three thresholds.
+-- Settings tab. One scrolling column in sections: who the settings belong to,
+-- the guards that protect, the guards and thresholds that ask for Ctrl, the
+-- list's extras, and the Next key.
 --------------------------------------------------------------------------------
+local MODIFIER_KEY = {
+  LSHIFT = true, RSHIFT = true, LCTRL = true, RCTRL = true,
+  LALT = true, RALT = true, LMETA = true, RMETA = true,
+}
+local MOUSE_KEY = { MiddleButton = "BUTTON3", Button4 = "BUTTON4", Button5 = "BUTTON5" }
+
 local function ensureOptions(parent)
   local o = CreateFrame("Frame", nil, parent, BackdropTemplateMixin and "BackdropTemplate" or nil)
   o:SetPoint("TOPLEFT", parent, "TOPLEFT", 5, -64)
-  o:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -5, 34)
+  o:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -5, 6)
   backdrop(o, 0.96)
   o:EnableMouse(true)
   o:Hide()
-  o.checks = {}
+  o.checks, o.boxes = {}, {}
 
-  local y = -8
-  for _, g in ipairs(GUARDS) do
-    local cb = CreateFrame("CheckButton", "DisenchanterGuard" .. g.key, o, "UICheckButtonTemplate")
+  local scroll = CreateFrame("ScrollFrame", "DisenchanterOptionsScroll", o, "UIPanelScrollFrameTemplate")
+  scroll:SetPoint("TOPLEFT", 6, -6)
+  scroll:SetPoint("BOTTOMRIGHT", -27, 6)
+  local c = CreateFrame("Frame", nil, scroll)
+  c:SetSize(ROW_W - 10, 1)
+  scroll:SetScrollChild(c)
+  o:SetScript("OnSizeChanged", function(self) c:SetWidth(math.max(1, self:GetWidth() - 38)) end)
+
+  local y = 0
+  local function section(title, sub)
+    y = y - 8
+    local fs = c:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    fs:SetPoint("TOPLEFT", 4, y)
+    fs:SetText(title .. (sub and ("  |cff888888" .. sub .. "|r") or ""))
+    local rule = c:CreateTexture(nil, "ARTWORK")
+    rule:SetPoint("TOPLEFT", 4, y - 13)
+    rule:SetPoint("TOPRIGHT", -4, y - 13)
+    rule:SetHeight(1)
+    rule:SetColorTexture(0.30, 0.32, 0.37, 0.7)
+    y = y - 17
+  end
+  local function check(id, label, get, set, tipTitle, tipBody)
+    local cb = CreateFrame("CheckButton", "DisenchanterOption" .. id, c, "UICheckButtonTemplate")
     cb:SetSize(22, 22)
-    cb:SetPoint("TOPLEFT", 8, y)
-    cb.key = g.key
-    local label = _G[cb:GetName() .. "Text"]
-    label:SetFontObject("GameFontHighlightSmall")
-    label:SetText(("%s  |cff888888(%s)|r"):format(g.label, g.hard and "protect" or "confirm"))
-    cb:SetScript("OnClick", function(self)
-      db().guards[self.key] = self:GetChecked() and true or false
-      DE.Refresh()
-    end)
+    cb:SetPoint("TOPLEFT", 4, y)
+    -- The template's label has been a global, .Text and .text over the years.
+    local text = _G[cb:GetName() .. "Text"] or cb.Text or cb.text
+    if text then
+      text:SetFontObject("GameFontHighlightSmall")
+      text:SetText(label)
+    end
+    cb.get = get
+    cb:SetScript("OnClick", function(self) set(self:GetChecked() and true or false) end)
+    if tipTitle then simpleTip(cb, tipTitle, tipBody) end
     o.checks[#o.checks + 1] = cb
     y = y - 22
+    return cb
   end
-
-  local function numberBox(labelText, width, get, set)
-    local fs = o:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    fs:SetPoint("TOPLEFT", 12, y - 6)
-    fs:SetText(labelText)
-    local eb = CreateFrame("EditBox", nil, o, "InputBoxTemplate")
-    eb:SetSize(width, 20)
+  -- A labelled whole-number box, indented under the guard it belongs to.
+  -- Committing lives in OnEditFocusLost so a typed value isn't silently
+  -- dropped by clicking elsewhere. Enter just clears focus; Escape reverts
+  -- the text first, so the commit that follows is a no-op.
+  local function number(label, get, set)
+    local fs = c:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    fs:SetPoint("TOPLEFT", 32, y - 5)
+    fs:SetText(label)
+    local eb = CreateFrame("EditBox", nil, c, "InputBoxTemplate")
+    eb:SetSize(46, 20)
     eb:SetPoint("LEFT", fs, "RIGHT", 12, 0)
     eb:SetAutoFocus(false)
     eb:SetNumeric(true)
-    -- Committing lives in OnEditFocusLost so a typed value isn't silently
-    -- dropped by clicking elsewhere. Enter just clears focus; Escape reverts
-    -- the text first, so the commit that follows is a no-op.
+    eb.get = get
     eb:SetScript("OnEditFocusLost", function(self)
-      set(tonumber(self:GetText()) or 0)
+      set(math.max(0, tonumber(self:GetText()) or 0))
       DE.Refresh()
     end)
     eb:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
     eb:SetScript("OnEscapePressed", function(self) self:SetText(tostring(get())); self:ClearFocus() end)
-    y = y - 26
+    o.boxes[#o.boxes + 1] = eb
+    y = y - 24
     return eb
   end
+  local function guardCheck(g)
+    check("Guard" .. g.key, g.label,
+      function() return cfg().guards[g.key] end,
+      function(v) cfg().guards[g.key] = v; DE.Refresh() end)
+  end
 
-  o.valueBox = numberBox("Ctrl-click BoEs worth over (gold)", 50,
-    function() return db().valueGold end,
-    function(v) db().valueGold = math.max(0, v) end)
-  o.ilvlBox = numberBox("Ctrl-click above item level (0 = off)", 50,
-    function() return db().ilvlCap end,
-    function(v) db().ilvlCap = math.max(0, v) end)
+  section("THIS CHARACTER")
+  check("Char", "Own guards and thresholds for " .. ((UnitName and UnitName("player")) or "this character"),
+    function() return DB.GetChar(GUARDS).own end,
+    function(v) DE.SetCharSettings(v) end,
+    "Per-character settings",
+    "Off: every character shares the guards and thresholds below. On: this character keeps its own, starting from a copy of the shared ones. The keep list, audit and run history are always shared.")
 
-  o.quality = CreateFrame("Button", nil, o, "UIPanelButtonTemplate")
-  o.quality:SetPoint("TOPLEFT", 12, y - 4)
-  o.quality:SetPoint("RIGHT", -12, 0)
-  o.quality:SetHeight(22)
+  section("PROTECT", "no click does anything")
+  for _, g in ipairs(GUARDS) do
+    if g.hard then guardCheck(g) end
+  end
+
+  section("ASK FOR A CTRL-CLICK")
+  for _, g in ipairs(GUARDS) do
+    if not g.hard then
+      guardCheck(g)
+      if g.key == "value" then
+        number("BoEs worth more than (gold)",
+          function() return cfg().valueGold end, function(v) cfg().valueGold = v end)
+      elseif g.key == "loss" then
+        number("Loses more than (silver)",
+          function() return cfg().lossSilver end, function(v) cfg().lossSilver = v end)
+      end
+    end
+  end
+  y = y - 4
+  number("Above item level (0 = off)",
+    function() return cfg().ilvlCap end, function(v) cfg().ilvlCap = v end)
+  o.quality = flatButton(c, "", 220, 22)
+  o.quality:SetPoint("TOPLEFT", 32, y - 2)
   o.quality:SetScript("OnClick", function()
-    local d = db()
-    d.confirmAbove = (d.confirmAbove >= 4) and 2 or (d.confirmAbove + 1)
+    local s = cfg()
+    s.confirmAbove = (s.confirmAbove >= 4) and 2 or (s.confirmAbove + 1)
     DE.Refresh()
   end)
-  o.quality:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Plain-click ceiling", 1, 0.82, 0)
-    GameTooltip:AddLine("Anything better than this needs a Ctrl-click. Click to cycle.", 0.6, 0.6, 0.6, true)
-    GameTooltip:Show()
-  end)
-  o.quality:SetScript("OnLeave", tipHide)
+  simpleTip(o.quality, "Plain-click ceiling", "Anything better than this needs a Ctrl-click. Click to cycle.")
+  y = y - 28
 
-  o.profit = CreateFrame("Button", nil, o, "UIPanelButtonTemplate")
-  o.profit:SetPoint("TOPLEFT", o.quality, "BOTTOMLEFT", 0, -6)
-  o.profit:SetPoint("RIGHT", -12, 0)
-  o.profit:SetHeight(22)
-  o.profit:SetScript("OnClick", function()
-    db().sortProfit = not db().sortProfit
-    DE.Resort()
-  end)
-  o.profit:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Estimated disenchant profit", 1, 0.82, 0)
-    GameTooltip:AddLine("Uses Auctionator or TSM prices for the item and its likely materials. Missing prices remain unsorted.", 0.6, 0.6, 0.6, true)
-    GameTooltip:Show()
-  end)
-  o.profit:SetScript("OnLeave", tipHide)
+  section("LIST AND TOOLTIPS")
+  check("Profit", "Sort by estimated profit, best first",
+    function() return db().sortProfit end,
+    function(v) db().sortProfit = v; DE.Resort() end,
+    "Estimated disenchant profit",
+    "Uses Auctionator or TSM prices for the item and its likely materials. Items with no price stay at the bottom.")
+  check("Tooltips", "Show disenchant info in item tooltips",
+    function() return db().tooltips end,
+    function(v) db().tooltips = v; DE.Refresh() end,
+    "Item tooltips",
+    "Adds what an item disenchants into and what that is worth to its tooltip, wherever it appears. Items in your bags also show their verdict.")
 
-  local hint = o:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  hint:SetPoint("BOTTOMLEFT", 12, 10)
-  hint:SetPoint("BOTTOMRIGHT", -12, 10)
+  section("NEXT-ITEM KEY", "Disenchant tab only")
+  local key = flatButton(c, "", 190, 22)
+  key:SetPoint("TOPLEFT", 6, y - 2)
+  local clear = flatButton(c, "Clear", 50, 22)
+  clear:SetPoint("LEFT", key, "RIGHT", 6, 0)
+  clear:SetScript("OnClick", function() DE.SetNextKey("none") end)
+  local function stopCapture()
+    key.capturing = nil
+    key:EnableKeyboard(false)
+    key:EnableMouseWheel(false)
+    DE.RefreshOptions()
+  end
+  key:EnableKeyboard(false)
+  key:SetScript("OnClick", function(self)
+    if self.capturing then stopCapture() return end
+    -- While capturing, this button swallows the keyboard. Give up after a few
+    -- seconds so a click that was never followed by a key can't leave it deaf.
+    local token = {}
+    self.capturing = token
+    self:EnableKeyboard(true)
+    self:EnableMouseWheel(true)
+    C_Timer.After(8, function() if key.capturing == token then stopCapture() end end)
+    DE.RefreshOptions()
+  end)
+  key:SetScript("OnKeyDown", function(self, pressed)
+    if not self.capturing or MODIFIER_KEY[pressed] then return end
+    stopCapture()
+    if pressed ~= "ESCAPE" then DE.SetNextKey(pressed) end
+  end)
+  key:SetScript("OnMouseWheel", function(self, delta)
+    if not self.capturing then return end
+    stopCapture()
+    DE.SetNextKey(delta > 0 and "MOUSEWHEELUP" or "MOUSEWHEELDOWN")
+  end)
+  key:SetScript("OnMouseDown", function(self, button)
+    if not (self.capturing and MOUSE_KEY[button]) then return end
+    stopCapture()
+    DE.SetNextKey(MOUSE_KEY[button])
+  end)
+  key:SetScript("OnHide", function(self) if self.capturing then stopCapture() end end)
+  simpleTip(key, "Next-item key",
+    "Click, then within a few seconds press a key (or scroll the wheel, or press mouse button 3-5, over this button). While the window is open on the Disenchant tab that key presses Disenchant next: one press, one Safe item. It goes back to its usual job when the window closes.")
+  o.key, o.keyClear = key, clear
+  y = y - 30
+
+  local hint = c:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  hint:SetPoint("TOPLEFT", 6, y - 6)
+  hint:SetPoint("TOPRIGHT", -6, y - 6)
   hint:SetJustifyH("LEFT")
   hint:SetText("Padlock a row to keep that exact item. |cffffd100/de keep #itemid|r keeps "
     .. "every version, |cffffd100/de keep name:text|r matches names.")
+  y = y - 40
+
+  c:SetHeight(-y)
   return o
 end
 
 function DE.RefreshOptions()
   local o = win and win.opts
   if not o then return end
-  local d = db()
-  for _, cb in ipairs(o.checks) do cb:SetChecked(d.guards[cb.key] and true or false) end
-  o.valueBox:SetText(tostring(d.valueGold))
-  o.ilvlBox:SetText(tostring(d.ilvlCap))
-  o.quality:SetText("Plain-click up to: " .. (CONFIRM_LABEL[d.confirmAbove] or "?"))
-  o.profit:SetText("Profit sorting: " .. (d.sortProfit and "On" or "Off"))
+  for _, cb in ipairs(o.checks) do cb:SetChecked(cb.get() and true or false) end
+  for _, eb in ipairs(o.boxes) do eb:SetText(tostring(eb.get())) end
+  o.quality:SetText("Plain-click up to: " .. (CONFIRM_LABEL[cfg().confirmAbove] or "?"))
+  local key = db().nextKey
+  o.key:SetText(o.key.capturing and "Press a key  (Esc cancels)"
+    or (key and ("Key: " .. keyLabel(key) .. "  — click to change") or "No key — click to set one"))
+  o.keyClear:SetEnabled(key ~= nil and not o.key.capturing)
 end
 
 --------------------------------------------------------------------------------
+local TAB_ID = { de = 1, trash = 2, split = 3, history = 4, options = 5 }
+
 local function ensureWindow()
   if win then return win end
   local f = CreateFrame("Frame", "DisenchanterFrame", UIParent,
@@ -1834,7 +2384,10 @@ local function ensureWindow()
     db().panel.x, db().panel.y = x, y
   end)
   f:SetFrameStrata("DIALOG")
-  f:SetScript("OnShow", function() DE.Resort() end)
+  -- The next-item key only exists while the window does: bound on the way in,
+  -- released (and the button disarmed) on the way out.
+  f:SetScript("OnShow", function() DE.Resort(); applyNextKey() end)
+  f:SetScript("OnHide", function() syncNext(nil); applyNextKey() end)
   tinsert(UISpecialFrames, "DisenchanterFrame") -- Esc closes it
 
   local header = f:CreateTexture(nil, "BORDER")
@@ -1844,12 +2397,16 @@ local function ensureWindow()
   header:SetColorTexture(0.10, 0.085, 0.13, 0.98)
   local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   title:SetPoint("TOPLEFT", 8, -5)
-  title:SetText("Disenchanter")
+  title:SetText("Disenchanter  |cff6f6a7a" .. VERSION .. "|r")
   local close = CreateFrame("Button", nil, f)
-  close:SetSize(18, 18)
+  close:SetSize(20, 18)
   close:SetPoint("TOPRIGHT", -2, -2)
-  local closeText = close:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  closeText:SetAllPoints(); closeText:SetText("x")
+  local closeHover = close:CreateTexture(nil, "HIGHLIGHT")
+  closeHover:SetAllPoints()
+  closeHover:SetColorTexture(0.80, 0.25, 0.25, 0.45)
+  local closeText = close:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  closeText:SetPoint("CENTER", 0, 1)
+  closeText:SetText("x")
   close:SetScript("OnClick", function() f:Hide() end)
 
   win = f
@@ -1859,6 +2416,7 @@ local function ensureWindow()
   win.status:SetPoint("TOPLEFT", 8, -25)
   win.status:SetPoint("TOPRIGHT", -8, -25)
   win.status:SetJustifyH("LEFT")
+  win.status:SetWordWrap(false)
 
   win.hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   win.hint:SetPoint("TOPLEFT", 8, -39)
@@ -1930,39 +2488,43 @@ local function ensureWindow()
   win.empty:SetPoint("CENTER")
   win.empty:SetText("Nothing disenchantable in your bags")
 
-  -- The options tab sits over the list, so it has to win on frame level.
+  -- The options tab sits over the list and the footer, so it has to win on
+  -- frame level.
   win.opts = ensureOptions(f)
   win.opts:SetFrameLevel(inset:GetFrameLevel() + 20)
 
-  local function mk(label, w)
-    local b = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    b:SetSize(w, 22)
-    b:SetText(label)
-    return b
-  end
-  local rescan = mk("Rescan", 80)
+  -- Footer, list tabs: Rescan, To chat, the filter, and — on the Disenchant
+  -- tab — the Next button in the corner.
+  local rescan = flatButton(f, "Rescan", 58)
   rescan:SetPoint("BOTTOMLEFT", 6, 6)
   rescan:SetScript("OnClick", function() questCache = {}; DE.Resort() end)
-  rescan:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Rescan and re-sort", 1, 1, 1)
-    GameTooltip:AddLine("While the window is open rows hold their place and new items join the bottom of their section. This puts the list back in order.", 0.6, 0.6, 0.6, true)
-    GameTooltip:Show()
-  end)
-  rescan:SetScript("OnLeave", tipHide)
+  simpleTip(rescan, "Rescan and re-sort",
+    "While the window is open rows hold their place and new items join the bottom of their section. This puts the list back in order.")
 
-  local report = mk("To chat", 80)
-  report:SetPoint("BOTTOMRIGHT", -20, 6)
+  local report = flatButton(f, "To chat", 58)
+  report:SetPoint("LEFT", rescan, "RIGHT", 4, 0)
   report:SetScript("OnClick", function() DE.Report() end)
+  simpleTip(report, "Print to chat", "Lists every item and its verdict in your chat window. Only you see it.")
   win.rescan, win.report = rescan, report
 
   local search = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
-  search:SetSize(120, 20)
-  search:SetPoint("BOTTOM", 0, 7)
+  search:SetHeight(20)
+  search:SetPoint("BOTTOMLEFT", 140, 7)
+  search:SetPoint("BOTTOMRIGHT", -164, 7)
   search:SetAutoFocus(false)
   search:SetMaxLetters(40)
-  search:SetTextInsets(6, 6, 0, 0)
+  search:SetTextInsets(2, 6, 0, 0)
+  -- A placeholder, so an empty box says what it is for.
+  search.placeholder = search:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  search.placeholder:SetPoint("LEFT", 3, 0)
+  search.placeholder:SetText("Filter")
+  local function placeholderState(self)
+    self.placeholder:SetShown(self:GetText() == "" and not self:HasFocus())
+  end
+  search:HookScript("OnEditFocusGained", placeholderState)
+  search:HookScript("OnEditFocusLost", placeholderState)
   search:SetScript("OnTextChanged", function(self, userInput)
+    placeholderState(self)
     if not userInput then return end
     filterText = self:GetText():gsub("^%s+", ""):gsub("%s+$", "")
     DE.Refresh()
@@ -1970,6 +2532,8 @@ local function ensureWindow()
   search:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
   search:SetScript("OnEscapePressed", function(self)
     self:SetText(""); self:ClearFocus()
+    filterText = ""
+    DE.Refresh()
   end)
   search:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
@@ -1980,8 +2544,46 @@ local function ensureWindow()
   search:SetScript("OnLeave", tipHide)
   win.search = search
 
+  -- The Next button: secure, like a row, and armed by syncNext at the top
+  -- Safe row. See the note above applyNextKey.
+  local nb = CreateFrame("Button", "DisenchanterNextButton", f, "SecureActionButtonTemplate")
+  nb:SetSize(136, 22)
+  nb:SetPoint("BOTTOMRIGHT", -20, 6)
+  nb:RegisterForClicks("AnyUp", "AnyDown")
+  nb.edge = nb:CreateTexture(nil, "BACKGROUND")
+  nb.edge:SetAllPoints()
+  nb.bg = nb:CreateTexture(nil, "BORDER")
+  nb.bg:SetPoint("TOPLEFT", 1, -1)
+  nb.bg:SetPoint("BOTTOMRIGHT", -1, 1)
+  local nbHover = nb:CreateTexture(nil, "HIGHLIGHT")
+  nbHover:SetAllPoints(nb.bg)
+  nbHover:SetColorTexture(1, 1, 1, 0.10)
+  nb.text = nb:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  nb.text:SetPoint("CENTER", 0, 0)
+  nb:SetScript("PreClick", notePending)
+  nb:SetScript("OnEnter", function(self)
+    local it = self.item
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    if it then
+      tipQuiet = true
+      GameTooltip:SetBagItem(it.bag, it.slot)
+      tipQuiet = false
+      GameTooltip:AddLine(" ")
+      GameTooltip:AddLine("Click to disenchant this — the top Safe row.", 0.4, 1, 0.4)
+    else
+      GameTooltip:SetText("Disenchant next", 1, 1, 1)
+      GameTooltip:AddLine("Disenchants the top row of Safe to disenchant, one item per click. Nothing to do right now.", 0.6, 0.6, 0.6, true)
+    end
+    local key = keyLabel(db().nextKey)
+    GameTooltip:AddLine(key and ("Key: " .. key .. " does the same while this tab is open.")
+      or "Set a key for this in Settings, or with /de key.", 0.6, 0.6, 0.6, true)
+    GameTooltip:Show()
+  end)
+  nb:SetScript("OnLeave", tipHide)
+  win.next = nb
+
   -- The Run Split tab's bottom row, swapped in for Rescan/To chat by SetTab.
-  local newRun = mk("New run", 80)
+  local newRun = flatButton(f, "New run", 70)
   newRun:SetPoint("BOTTOMLEFT", 6, 6)
   newRun:SetScript("OnClick", function()
     local archived = startRun()
@@ -1989,25 +2591,15 @@ local function ensureWindow()
       .. " marker set — the Run Split tab now counts from this moment.")
     DE.Refresh()
   end)
-  newRun:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Start a new run", 1, 1, 1)
-    GameTooltip:AddLine("Saves the run so far to the History tab, then moves the marker to now. Earlier disenchants stay in /de audit but stop counting toward this run's split.", 0.6, 0.6, 0.6, true)
-    GameTooltip:Show()
-  end)
-  newRun:SetScript("OnLeave", tipHide)
+  simpleTip(newRun, "Start a new run",
+    "Saves the run so far to the History tab, then moves the marker to now. Earlier disenchants stay in /de audit but stop counting toward this run's split.")
   newRun:Hide()
 
-  local announce = mk("Announce", 90)
-  announce:SetPoint("LEFT", newRun, "RIGHT", 6, 0)
+  local announce = flatButton(f, "Announce", 78)
+  announce:SetPoint("LEFT", newRun, "RIGHT", 4, 0)
   announce:SetScript("OnClick", function() DE.Split("party") end)
-  announce:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Announce the split", 1, 1, 1)
-    GameTooltip:AddLine("Posts this run's totals and shares to party or raid chat. Only ever on this click.", 0.6, 0.6, 0.6, true)
-    GameTooltip:Show()
-  end)
-  announce:SetScript("OnLeave", tipHide)
+  simpleTip(announce, "Announce the split",
+    "Posts this run's totals, shares and estimated value to party or raid chat. Only ever on this click.")
   announce:Hide()
   win.newRun, win.announce = newRun, announce
 
@@ -2016,7 +2608,7 @@ local function ensureWindow()
   local grip = CreateFrame("Button", nil, f)
   grip:SetSize(14, 14)
   grip:SetPoint("BOTTOMRIGHT", 0, 0)
-  grip:SetFrameLevel(f:GetFrameLevel() + 20)
+  grip:SetFrameLevel(f:GetFrameLevel() + 30)
   grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
   grip:SetScript("OnMouseDown", function() f:StartSizing("BOTTOMRIGHT") end)
   grip:SetScript("OnMouseUp", function()
@@ -2065,20 +2657,21 @@ end
 function DE.SetTab(tab)
   local f = ensureWindow()
   if tab == "run" then tab = "split" end -- compatibility with older callers
+  if not TAB_ID[tab] then tab = "de" end
   f.tab = tab
-  local tabID = tab == "trash" and 2 or tab == "split" and 3
-    or tab == "history" and 4 or tab == "options" and 5 or 1
-  f:SelectTabChrome(tabID)
-  local split = tab == "split"
-  local history = tab == "history"
-  local options = tab == "options"
-  local inventory = split or history
-  f.rescan:SetShown(not inventory and not options)
-  f.report:SetShown(not inventory and not options)
-  f.search:SetShown(not inventory and not options)
-  f.newRun:SetShown(split)
-  f.announce:SetShown(split)
-  f.opts:SetShown(options)
+  f:SelectTabChrome(TAB_ID[tab])
+  local list = tab == "de" or tab == "trash"
+  f.rescan:SetShown(list)
+  f.report:SetShown(list)
+  f.search:SetShown(list)
+  -- The filter stretches into the corner the Next button leaves free.
+  -- In combat the button can't be hidden, so it keeps its corner until after.
+  local corner = tab == "de" or (InCombatLockdown() and f.next:IsShown())
+  f.search:SetPoint("BOTTOMRIGHT", corner and -164 or -24, 7)
+  f.newRun:SetShown(tab == "split")
+  f.announce:SetShown(tab == "split")
+  f.opts:SetShown(tab == "options")
+  applyNextKey()
   DE.Resort()
 end
 
@@ -2353,6 +2946,7 @@ ev:RegisterEvent("GROUP_ROSTER_UPDATE") -- the Run Split tab's shares and Announ
 -- only ever a moment of dead clicks, never a stale target.
 local pending
 local function queueRefresh()
+  tipIndex = nil
   if pending then return end
   pending = true
   C_Timer.After(0.1, function()
@@ -2370,6 +2964,7 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     resumeSession()
     ensureWindow()
     DE.InitBroker()
+    hookTooltips()
     if not knowsDisenchant() then
       -- Still perfectly usable as a "what would this give me" viewer, so this
       -- is a note, not a refusal to load.
@@ -2393,9 +2988,18 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     queueRefresh()
 
   elseif event == "PLAYER_REGEN_DISABLED" then
-    -- The rows can't be disarmed here: lockdown is already active by the time
-    -- this event fires, so SetAttribute would be rejected. Harmless — the game
-    -- refuses to cast Disenchant in combat — so just grey the list.
+    -- The rows usually can't be disarmed here: on the clients this was built
+    -- against lockdown is already active when the event fires, so SetAttribute
+    -- would be rejected. Harmless — the game refuses to cast Disenchant in
+    -- combat — so just grey the list. Where lockdown has not started yet,
+    -- take the chance: disarm everything and release the next-item key.
+    if not InCombatLockdown() then
+      disarmAll()
+      if win and ClearOverrideBindings then
+        ClearOverrideBindings(win)
+        keyDirty = true -- PLAYER_REGEN_ENABLED binds it again
+      end
+    end
     if win and win:IsShown() then
       win.content:SetAlpha(0.35)
       win.status:SetText(statusText({}, {}, {}))
@@ -2410,6 +3014,7 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
       pendingToggle = false
       DE.Toggle()
     end
+    if keyDirty then applyNextKey() end
     queueRefresh()
 
   elseif event == "GROUP_ROSTER_UPDATE" then
@@ -2421,6 +3026,7 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
       -- Grab the consumed item's link before CastFinished clears DE.cast, so
       -- the loot line that follows can be written down as "src → out".
       lastDESource = (DE.cast and DE.cast.link) or (DE._pending and DE._pending.link) or nil
+      lastDEOwn = DE.cast and DE.cast.link or nil
       DE.CastFinished()
     end
 
@@ -2490,28 +3096,29 @@ function DE.Command(rest)
   elseif cmd == "value" then
     local g = tonumber(args)
     if not g then pr("usage: /de value <gold> (0 turns the value guard off)") return end
-    db().valueGold = math.max(0, g)
+    cfg().valueGold = math.max(0, g)
     pr(g > 0 and ("BoEs worth more than %s now need a Ctrl-click."):format(money(g * 10000))
       or "value guard off.")
     DE.Refresh()
   elseif cmd == "ilvl" then
     local n = tonumber(args)
     if not n then pr("usage: /de ilvl <n> (0 turns the item-level cap off)") return end
-    db().ilvlCap = math.max(0, n)
+    cfg().ilvlCap = math.max(0, n)
     pr(n > 0 and ("item level over %d now needs a Ctrl-click."):format(n) or "item-level cap off.")
     DE.Refresh()
   elseif cmd == "confirm" then
     local q = CONFIRM_WORD[args:lower()]
     if not q then pr("usage: /de confirm <green|blue|epic>") return end
-    db().confirmAbove = q
+    cfg().confirmAbove = q
     pr("plain-click up to " .. (CONFIRM_LABEL[q] or "?") .. "; anything better needs Ctrl.")
     DE.Refresh()
   elseif cmd == "guard" then
     if args == "" then
-      pr("guards (|cffffd100/de guard <name>|r toggles one):")
+      pr("guards" .. (DB.GetChar(GUARDS).own and ", this character's own" or "")
+        .. " (|cffffd100/de guard <name>|r toggles one):")
       for _, g in ipairs(GUARDS) do
         print(("    %-9s %s  %s"):format(g.key,
-          db().guards[g.key] and "|cff33cc44on |r" or "|cffff5555off|r", g.label))
+          cfg().guards[g.key] and "|cff33cc44on |r" or "|cffff5555off|r", g.label))
       end
       return
     end
@@ -2519,10 +3126,34 @@ function DE.Command(rest)
     local known = false
     for _, g in ipairs(GUARDS) do if g.key == key then known = true end end
     if not known then pr("no guard called '" .. key .. "'. |cffffd100/de guard|r lists them.") return end
-    local d = db()
-    d.guards[key] = not d.guards[key]
-    pr(("guard %s is now %s."):format(key, d.guards[key] and "|cff33cc44on|r" or "|cffff5555off|r"))
+    local guards = cfg().guards
+    guards[key] = not guards[key]
+    pr(("guard %s is now %s."):format(key, guards[key] and "|cff33cc44on|r" or "|cffff5555off|r"))
     DE.Refresh()
+  elseif cmd == "loss" then
+    local n = tonumber(args)
+    if not n then pr("usage: /de loss <silver> — how much a disenchant may lose before the loss guard asks for Ctrl") return end
+    cfg().lossSilver = math.max(0, n)
+    pr(("the loss guard now asks for a Ctrl-click when disenchanting loses more than %s.%s"):format(
+      money(cfg().lossSilver * 100),
+      cfg().guards.loss and "" or " It is switched off — |cffffd100/de guard loss|r turns it on."))
+    DE.Refresh()
+  elseif cmd == "key" then
+    if args == "" then
+      local key = db().nextKey
+      pr(key and ("next-item key: |cffffd100%s|r. |cffffd100/de key none|r clears it."):format(key)
+        or "no next-item key set. |cffffd100/de key <key>|r sets one, e.g. /de key F or /de key MOUSEWHEELDOWN.")
+    else
+      DE.SetNextKey(args)
+    end
+  elseif cmd == "tooltip" or cmd == "tooltips" then
+    db().tooltips = not db().tooltips
+    pr("disenchant info in item tooltips " .. (db().tooltips and "|cff33cc44on|r." or "|cffff5555off|r."))
+    DE.Refresh()
+  elseif cmd == "char" then
+    DE.SetCharSettings(not DB.GetChar(GUARDS).own)
+  elseif cmd == "yields" then
+    DE.Yields(args)
   elseif cmd == "learned" then
     DE.Learned(args:lower() == "clear")
   elseif cmd == "tally" then
@@ -2545,7 +3176,7 @@ function DE.Command(rest)
     pr("click mode: |cffffd100" .. d.clickMode .. "|r")
     DE.Refresh()
   else
-    pr("commands: (no args) | trash | run | history | scan | keep <#id|[link]|name:text> | keep del <n> | keeps | value <gold> | ilvl <n> | confirm <green|blue|epic> | guard [name] | learned [clear] | tally | audit [n|clear] | split [start|say|party|raid] | runs [name <text>|end|clear] | profit | mode | debug")
+    pr("commands: (no args) | trash | run | history | scan | keep <#id|[link]|name:text> | keep del <n> | keeps | value <gold> | loss <silver> | ilvl <n> | confirm <green|blue|epic> | guard [name] | char | key [key|none] | tooltip | yields [clear] | learned [clear] | tally | audit [n|clear] | split [start|say|party|raid] | runs [name <text>|end|clear] | profit | mode | debug")
   end
 end
 
@@ -2554,6 +3185,8 @@ SLASH_DISENCHANTER2 = "/disenchanter"
 SlashCmdList.DISENCHANTER = function(msg) DE.Command(msg) end
 
 DE._verdict = verdict
+DE._tooltip = tooltipLines
+DE._recordYield = recordYield
 DE._itemKey = itemKey
 DE._resumeSession = resumeSession
 DE._trashVerdict = trashVerdict

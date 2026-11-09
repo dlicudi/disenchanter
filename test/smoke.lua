@@ -11,7 +11,7 @@ local function stub()
   f.SetScript=function(s,k,v)s._scripts[k]=v end; f.GetScript=function(s,k)return s._scripts[k] end
   f.Show=function(s)s._shown=true;if s._scripts.OnShow then s._scripts.OnShow(s) end end
   f.Hide=function(s)s._shown=false;if s._scripts.OnHide then s._scripts.OnHide(s) end end
-  f.IsShown=function(s)return s._shown end; f.SetShown=function(s,v)if v then s:Show() else s:Hide() end end
+  f.IsShown=function(s)return s._shown end;f.IsVisible=function(s)return s._shown and not UI_HIDDEN end; f.SetShown=function(s,v)if v then s:Show() else s:Hide() end end
   f.SetAttribute=function(s,k,v)s._attr[k]=v end; f.GetAttribute=function(s,k)return s._attr[k] end
   f.CreateFontString=function()return stub()end; f.CreateTexture=function()return stub()end
   f.GetWidth=function()return 380 end; f.GetHeight=function()return 460 end
@@ -101,6 +101,109 @@ step("row order holds across bag updates and re-sorts on request",function()
   w:Hide();w:Show();assert(shown()=="Item11 Item12 Item13",shown()) -- reopening sorts afresh
   C_Container.GetContainerNumSlots,C_Container.GetContainerItemInfo,ITEM_INFO=numSlots,itemInfo,nil
   DE.Resort();assert(shown()=="")
+end)
+local function withBags(bags,fn)
+  local numSlots,itemInfo=C_Container.GetContainerNumSlots,C_Container.GetContainerItemInfo
+  C_Container.GetContainerNumSlots=function(bag)return bag==0 and 4 or 0 end
+  C_Container.GetContainerItemInfo=function(bag,slot)return bag==0 and bags[slot] or nil end
+  ITEM_INFO=function(id)
+    id=tonumber(id) or tonumber(tostring(id):match("item:(%d+)"))
+    return "Item"..id,"item:"..id,2,10,nil,nil,nil,nil,"INVTYPE_CHEST",nil,id*100,4,1,1
+  end
+  DE.Resort()
+  local ok,err=pcall(fn)
+  C_Container.GetContainerNumSlots,C_Container.GetContainerItemInfo,ITEM_INFO=numSlots,itemInfo,nil
+  DE.Resort()
+  if not ok then error(err,0) end
+end
+step("the Next button follows the top safe row; its key only lives on the open Disenchant tab",function()
+  local w=DE._window();local d=DE._db();local binds={}
+  SetOverrideBindingClick=function(_,_,key,button)binds[key]=button end
+  ClearOverrideBindings=function()binds={} end
+  if not w:IsShown() then w:Show() end
+  withBags({{itemID=11},{itemID=13}},function()
+    DE.SetNextKey("f");assert(d.nextKey=="F")
+    DE.SetTab("de");local nb=w.next
+    assert(nb:IsShown() and nb.item.itemID==11 and nb._attr.type1=="macro" and nb._attr["target-slot1"]==1)
+    assert(nb._attr["ctrl-type1"]==nil and binds.F=="DisenchanterNextButton")
+    assert(nb._attr.macrotext1:find("[nocombat]",1,true) and not w.rows[1]._attr.macrotext1:find("[",1,true))
+    local timers={};local immediate=C_Timer.After;C_Timer.After=function(_,fn)timers[#timers+1]=fn end
+    DE._event("BAG_UPDATE",0);assert(nb._attr.type1==nil and nb.item==nil) -- disarmed at once
+    C_Timer.After=immediate;timers[1]();assert(nb._attr.type1=="macro")
+    DE.SetTab("trash");assert(not nb:IsShown() and nb._attr.type1==nil and binds.F==nil)
+    DE.SetTab("de");assert(binds.F and nb._attr["target-slot1"]==1)
+    d.collapsed.safe=true;DE.Refresh();assert(nb._attr.type1==nil);d.collapsed.safe=false -- unseen is untouchable
+    DE.cast={itemID=11,bag=0,slot=1,startTime=0,duration=3};DE.Refresh()
+    assert(nb._attr.type1==nil and w.rows[1].cancelCast);DE.cast=nil;DE.Refresh() -- nothing mid-cast
+    w:Hide();assert(nb._attr.type1==nil and binds.F==nil)
+    w:Show();assert(nb._attr.type1=="macro" and binds.F)
+    -- the whole UI hidden (Alt-Z): still "shown", but nothing may stay armed or bound
+    UI_HIDDEN=true;w:GetScript("OnHide")(w);assert(nb._attr.type1==nil and binds.F==nil)
+    DE._event("BAG_UPDATE",0);assert(nb._attr.type1==nil and w.rows[1]._attr.type1==nil)
+    UI_HIDDEN=nil;w:GetScript("OnShow")(w);assert(nb._attr.type1=="macro" and binds.F)
+    DE.SetNextKey("ctrl-f");assert(d.nextKey=="F");DE.SetNextKey("BUTTON2");assert(d.nextKey=="F")
+    DE.SetNextKey("none");assert(d.nextKey==nil and binds.F==nil)
+  end)
+end)
+step("the loss guard asks for Ctrl only when a priced disenchant loses enough",function()
+  local d=DE._db();d.guards.loss=true;d.lossSilver=50
+  assert(DE._verdict(item({boe=false,profit=-4000}),nil)=="safe")
+  local tier,reason=DE._verdict(item({boe=false,profit=-6000,valueSrc="vendor"}),nil)
+  assert(tier=="confirm" and reason:find("vendoring",1,true))
+  assert(DE._verdict(item({boe=false}),nil)=="safe") -- unpriced: the guard stands down
+  d.guards.loss=false;assert(DE._verdict(item({boe=false,profit=-6000}),nil)=="safe")
+end)
+step("a character can carry its own guards without touching the account's",function()
+  local d=DE._db();d.guards.set=true
+  local setPiece=item({boe=false,setID=5})
+  assert(DE._verdict(setPiece,nil)=="blocked")
+  DE.SetCharSettings(true);assert(DisenchanterCharDB.own and DisenchanterCharDB.guards.set==true)
+  DE.Command("guard set");assert(DisenchanterCharDB.guards.set==false and d.guards.set==true)
+  assert(DE._verdict(setPiece,nil)=="safe")
+  DE.SetCharSettings(false);assert(DE._verdict(setPiece,nil)=="blocked")
+  DE.SetCharSettings(true);assert(DE._verdict(setPiece,nil)=="safe") -- what it had is kept
+  DE.SetCharSettings(false);d.guards.set=false
+end)
+step("item tooltips name the yield, and the verdict for items in the bags",function()
+  local lines={};local add,get=GameTooltip.AddLine,GameTooltip.GetItem
+  GameTooltip.AddLine=function(_,text)lines[#lines+1]=text end
+  withBags({{itemID=11}},function()
+    GameTooltip.GetItem=function()return "Item11","item:11" end
+    DE._tooltip(GameTooltip);local text=table.concat(lines,"\n")
+    assert(text:find("Disenchants into",1,true) and text:find("Safe to disenchant",1,true),text)
+    lines={};GameTooltip.GetItem=function()return "Item99","item:99" end
+    DE._tooltip(GameTooltip);text=table.concat(lines,"\n")
+    assert(text:find("Disenchants into",1,true) and not text:find("In your bags",1,true),text)
+    lines={};DE._db().tooltips=false;DE._tooltip(GameTooltip);assert(#lines==0);DE._db().tooltips=true
+    DE._tooltip(stub());assert(#lines==0) -- somebody else's tooltip
+  end)
+  GameTooltip.AddLine,GameTooltip.GetItem=add,get
+end)
+step("estimates switch to your own results after enough disenchants",function()
+  local d=DE._db();d.yields={}
+  Auctionator={API={v1={GetAuctionPriceByItemID=function()return 100 end}}}
+  ITEM_INFO=function()return "Src","item:1",2,20 end
+  local book=DE._expectedDisenchantValue(2,20)
+  for _=1,24 do DE._recordYield("item:1",10940,2) end
+  local v,seen=DE._expectedDisenchantValue(2,20);assert(v==book and seen==nil)
+  DE._recordYield("item:1",10940,2)
+  v,seen=DE._expectedDisenchantValue(2,20);assert(v==200 and seen==25)
+  DE.Yields("");DE.Yields("clear");assert(next(d.yields)==nil)
+  Auctionator=nil;ITEM_INFO=nil
+end)
+step("the split shows and announces an estimated value when materials are priced",function()
+  local d=DE._db();local w=DE._window();d.splitStart=999;d.runs={}
+  d.audit={{t=1000,out="|cffffffff|Hitem:10940::::::::23::::::::::|h[Strange Dust]|h|r",n=4}}
+  local sent={};SendChatMessage=function(msg)sent[#sent+1]=msg end
+  DE.Split("say");assert(#sent==2) -- heading and the material: nothing priced, nothing claimed
+  Auctionator={API={v1={GetAuctionPriceByItemID=function()return 2550 end}}}
+  sent={};DE.Split("say");assert(sent[3]=="Estimated value: 1g 2s",sent[3])
+  if not w:IsShown() then w:Show() end
+  DE.SetTab("split");assert(w.rows[1]:IsShown() and w.rows[1].item.run and not w.next:IsShown())
+  DE.RunHistory("end");assert(d.runs[1].value==10200)
+  DE.SetTab("history");assert(w.rows[2].item.runLink) -- roster row, then the material
+  DE.SetTab("options");DE.SetTab("trash");DE.SetTab("de")
+  Auctionator=nil;d.audit={};d.runs={}
 end)
 step("malformed saved variables are repaired",function()
   DisenchanterDB={keep="bad",learned=true,audit={{bad=true}},guards={quest="yes"},collapsed=3,panel=false,confirmAbove=99,valueGold="-2",ilvlCap="7"}

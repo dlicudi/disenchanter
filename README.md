@@ -21,18 +21,58 @@ the bottom of its bucket until you press **Rescan** or reopen the window.
 While a disenchant is casting, click its row again to cancel it. The active row
 temporarily becomes a secure `/stopcasting` button and cannot target an item.
 
+### Disenchant next
+
+The **Disenchant next** button in the bottom-right corner always points at the
+top row of *Safe to disenchant* — that row is tagged `next` — so you can work
+through a bag without moving the mouse. It is one item per click, it never
+touches a Check first or Protected item, and it does nothing while a cast is
+in progress or while the Safe section is collapsed: what you can't see, it
+can't disenchant.
+
+You can give it a key: **Settings → Next-item key**, or `/de key F`
+(`/de key none` clears it). The key is only bound while the window is open on
+the Disenchant tab; close the window or switch tab and the key goes back to
+its normal job. Hiding the whole interface (Alt-Z) releases it too. Use a
+single key with no modifier, the mouse wheel (`MOUSEWHEELUP` /
+`MOUSEWHEELDOWN`) or mouse buttons 3–5. The left and right mouse buttons are
+refused.
+
+The button's macro is `/cast [nocombat] Disenchant`: a secure button can't be
+disarmed once combat has started, so the refusal travels with the macro.
+
 The compact panel can be moved and resized from its bottom-right grip; its size
 and position are remembered. Rows keep their larger two-line targets so the
 yield or safety reason stays visible even in the denser layout.
+
+Each row carries a figure on the right: the estimated gain or loss from
+disenchanting on the Disenchant tab, the vendor value on Cleanup, the total
+worth on Run Split. Section headers add those figures up.
 
 The search box filters by item name or safety reason. Bucket labels include
 text markers (`[OK]`, `[CHECK]`, and `[LOCKED]`) so they do not rely on color
 alone, and item tooltips identify the exact bag and slot.
 
 When Auctionator or TradeSkillMaster has prices for both an item and its likely
-materials, rows show an approximate disenchant gain or loss. Enable **Profit
-sorting** in Options (or `/de profit`) to put the best estimated return first.
-The estimate uses approximate Classic drop odds and is guidance, not a promise.
+materials, rows show an approximate disenchant gain or loss. Enable **Sort by
+estimated profit** in Settings (or `/de profit`) to put the best estimated
+return first. The estimate starts from approximate Classic drop odds and is
+guidance, not a promise.
+
+It gets better with use. Every disenchant made from the window is counted
+against its quality and item-level bracket, and once you have 25 of a kind the
+estimate for that bracket uses what you actually received instead of the book
+odds. `/de yields` prints the tallies; `/de yields clear` forgets them.
+
+### Item tooltips
+
+Any disenchantable item's tooltip — in your bags, at the auction house, on a
+loot roll, from a chat link — gains what it disenchants into and, with prices
+available, what those materials are worth against selling it. Items in your
+bags add an **In your bags** line with the verdict (Safe, Ctrl-click or
+Protected, and why). That line describes the copy you are carrying, so it
+also appears on an auction or a chat link for the same item. Turn all of this
+off in Settings or with `/de tooltip`.
 
 Each row shows what it's likely to turn into (`Arcane Dust / Greater Planar
 Essence / Small Prismatic Shard`) or, if it's held back, why.
@@ -66,7 +106,9 @@ audit on screen instead of scrolling away in chat. `/de run` opens the
 
 - **Materials this run** — every material produced since the run marker, with
   the split for the current group on each row: `[Large Prismatic Shard] x13 —
-  2 each for 5 members, 3 spare`.
+  2 each for 5 members, 3 spare`. With Auctionator or TSM prices each row also
+  shows what that material is worth, the header totals the run, and the status
+  line gives the value of one share.
 - **Log** — the drops newest-first: what was consumed → what it produced, the
   time, the zone, and your group size at that moment.
 
@@ -83,14 +125,17 @@ with it.
 
 Press **New run** as the run begins: it saves the run so far to History and
 moves the marker to now (same as `/de split start`). Earlier disenchants stay in `/de audit` but stop
-counting toward this run. **Announce** posts the totals and shares to
-party/raid chat — the only time the addon ever speaks, and only on that click.
+counting toward this run. **Announce** posts the totals, shares and (when
+priced) the estimated value to party/raid chat — the only time the addon ever
+speaks, and only on that click.
 The split uses the roster at the moment you announce; who was present for
 which boss is the loot master's call, not arithmetic.
 
 The separate **History** tab contains archived runs. Expand a run to inspect
-its material totals and the roster captured when it ended. This keeps the live
-split inventory focused on the current run instead of mixing it with history.
+its roster and material totals. The header shows what the run was worth when
+it was archived; the rows show each material at today's prices. This keeps the
+live split inventory focused on the current run instead of mixing it with
+history.
 
 ## Safety
 
@@ -103,7 +148,10 @@ carrying a plain macro that runs only on your click:
 
 That macro only ever runs on **your** click, on the row **you** clicked —
 Blizzard's protected-call rules make anything else impossible. There is no
-automation loop and no "disenchant everything" button.
+automation loop and no "disenchant everything" button. **Disenchant next** is
+the same secure button as the top Safe row, parked where it doesn't move: one
+click or key press, one cast, and it disarms with the rows whenever bags
+change.
 
 The macro deliberately stops there — there is no `/use <bag> <slot>` line.
 A macro doesn't halt when `/cast` fails, so on a character without Disenchant
@@ -160,6 +208,7 @@ move an item to Protected; the rest only ask for a Ctrl-click.
 | `itemrack` | Named in one of your ItemRack sets. *protect* |
 | `boe` | Any bind-on-equip item. Off by default. *confirm* |
 | `value` | BoEs worth more than `/de value` — Auctionator or TSM market price if either is installed, vendor price otherwise. *confirm* |
+| `loss` | Disenchanting is estimated to lose more than `/de loss` silver against selling the item. Needs Auctionator or TSM prices; without them it stands down. Off by default. *confirm* |
 
 Press **Allow** on a Protected row to drop it to "check first" for this session.
 That override is deliberately not saved: a guard you waved past today is back
@@ -171,6 +220,14 @@ The padlock keeps that exact item: lock "Notched Shortsword of Magic" and
 "Notched Shortsword of Healing" is still offered. `/de keep #itemid` is the
 broad form and covers every version of the item; such rows read "on your keep
 list (every version of this item)", and unlocking one removes the whole entry.
+
+### Per-character settings
+
+Guards and thresholds are shared by every character by default. Tick **Own
+guards and thresholds** at the top of Settings (or `/de char`) and that
+character keeps its own set, starting from a copy of the shared ones — useful
+when the upgrade and Pawn guards make sense on a main but not on a bank alt.
+The keep list, audit, run history and observed yields are always shared.
 
 ## Commands
 
@@ -185,9 +242,14 @@ list (every version of this item)", and unlocking one removes the whole entry.
 /de keep del <n>          drop keep-list entry n
 /de keeps                 list the keep list
 /de value <gold>          BoE value that needs a Ctrl-click (0 = off)
+/de loss <silver>         how much a disenchant may lose before the loss guard asks for Ctrl
 /de ilvl <n>              item level that needs a Ctrl-click (0 = off)
 /de confirm <green|blue|epic>   quality above which a Ctrl-click is needed
 /de guard [name]          list guards, or toggle one
+/de char                  switch this character between shared and its own guards
+/de key [key|none]        show, set or clear the Disenchant next key
+/de tooltip               toggle disenchant info in item tooltips
+/de yields [clear]        what your own disenchants have produced; clear forgets it
 /de learned [clear]       items the server refused; clear forgets them
 /de tally                 what you've disenchanted this session
 /de audit [n|clear]       the log: what → what, when, where, group size
@@ -250,7 +312,8 @@ ended run's drops never reappear in the live split; `/de runs name` and
 
 All soft — the addon works without any of them.
 
-- **Auctionator** / **TradeSkillMaster** — market price for the value guard.
+- **Auctionator** / **TradeSkillMaster** — market prices for the value and loss
+  guards, profit estimates, tooltips and run values.
 - **Pawn** — the upgrade guard also asks Pawn.
 - **ItemRack** — items in your saved sets are protected.
 
@@ -288,8 +351,9 @@ npm test
 
 The tests cover syntax and version consistency, legacy/modern container APIs,
 saved-variable repair, guard precedence, value and quality gates, secure
-plain/Ctrl attribute separation, loot filtering, combat deferral, and verified
-Trash deletion. Blizzard's secure execution and lockdown cannot be simulated
+plain/Ctrl attribute separation, loot filtering, combat deferral, verified
+Trash deletion, the Next button's arming and key lifetime, the loss guard,
+per-character settings, tooltip lines, observed yields, and run values. Blizzard's secure execution and lockdown cannot be simulated
 outside the game, so each release also needs this short client checklist on
 every supported branch:
 
@@ -304,3 +368,12 @@ every supported branch:
    no success line or audit row is produced.
 5. Complete a disenchant, then loot an unrelated item immediately; confirm only
    enchanting materials appear in `/de tally`, `/de audit`, and the Run Split tab.
+6. Click **Disenchant next** and confirm it disenchants the row tagged `next`
+   and nothing else. Set a key with `/de key`, confirm it works on the
+   Disenchant tab, does nothing on Cleanup, and returns to its normal binding
+   when the window closes and when the interface is hidden with Alt-Z. Enter
+   combat with the window open and confirm the key does nothing.
+7. Hover a disenchantable item in the bags and at a vendor or in a chat link;
+   confirm the tooltip lines appear once and the bag item shows its verdict.
+8. Open Settings, scroll it, change a threshold, and toggle per-character
+   settings; confirm the list follows.

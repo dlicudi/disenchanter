@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Added **Disenchant next**: a fixed button in the footer that disenchants the
+  top Safe row, one item per click, with an optional key (`/de key`, or
+  Settings) that is only bound while the window is open on the Disenchant tab.
+- Added the `loss` guard: asks for a Ctrl-click when disenchanting is estimated
+  to lose more than `/de loss` silver against selling the item. Off by default.
+- Item tooltips now show what a disenchantable item turns into, what the
+  materials are worth, and — for items in your bags — the verdict.
+  `/de tooltip` turns it off.
+- The Run Split tab, `/de split` and Announce now include the run's estimated
+  value and the value of one share when materials are priced; archived runs
+  remember what they were worth.
+- Value estimates learn from your own results: after 25 disenchants in a
+  quality and item-level bracket the estimate uses what you actually received.
+  `/de yields` lists them.
+- Guards and thresholds can be per-character (`/de char`, or Settings); the
+  keep list, audit and history stay shared.
+- Interface: flat buttons throughout, a right-hand figure column on rows with
+  section totals in the headers, a placeholder in the filter box, and a
+  scrolling Settings tab organised into sections. The minimum window width is
+  now 380.
+- Fixed: pressing Escape in the filter box emptied the box but left the list
+  filtered.
 - Rows now hold their position while the window is open: a bag update no longer
   re-sorts the list under the cursor, and newly looted items join the bottom of
   their section. Opening the window, switching tab, changing the sort, or

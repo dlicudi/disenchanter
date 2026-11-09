@@ -2,7 +2,24 @@
 -- no UI or gameplay dependencies, so schema changes can be tested in isolation.
 DisenchanterDBStore = DisenchanterDBStore or {}
 local Store = DisenchanterDBStore
-local cached
+local cached, cachedChar
+
+-- The guard switches and thresholds. They live in the account table by
+-- default and in the per-character table when that character opted in, so the
+-- same repair runs against either.
+local function repairSettings(s, guards)
+  s.confirmAbove = tonumber(s.confirmAbove) or 2
+  if s.confirmAbove < 2 or s.confirmAbove > 4 then s.confirmAbove = 2 end
+  s.valueGold = math.max(0, tonumber(s.valueGold) or 10)
+  s.ilvlCap = math.max(0, tonumber(s.ilvlCap) or 0)
+  s.lossSilver = math.max(0, tonumber(s.lossSilver) or 50)
+  if type(s.guards) ~= "table" then s.guards = {} end
+  for _, guard in ipairs(guards) do
+    if type(s.guards[guard.key]) ~= "boolean" then
+      s.guards[guard.key] = not guard.off
+    end
+  end
+end
 
 local function repair(d, guards, schemaVersion)
   local schema = tonumber(d.schemaVersion) or 0
@@ -21,11 +38,10 @@ local function repair(d, guards, schemaVersion)
   if d.collapsed.tblocked == nil then d.collapsed.tblocked = true end
   if type(d.panel) ~= "table" then d.panel = {} end
 
-  d.confirmAbove = tonumber(d.confirmAbove) or 2
-  if d.confirmAbove < 2 or d.confirmAbove > 4 then d.confirmAbove = 2 end
-  d.valueGold = math.max(0, tonumber(d.valueGold) or 10)
-  d.ilvlCap = math.max(0, tonumber(d.ilvlCap) or 0)
+  repairSettings(d, guards)
   if type(d.sortProfit) ~= "boolean" then d.sortProfit = false end
+  if type(d.tooltips) ~= "boolean" then d.tooltips = true end
+  if type(d.nextKey) ~= "string" or d.nextKey == "" then d.nextKey = nil end
   if type(d.sessionStart) ~= "number" then d.sessionStart = nil end
   if type(d.lastSeen) ~= "number" then d.lastSeen = nil end
 
@@ -33,10 +49,20 @@ local function repair(d, guards, schemaVersion)
   -- default; the alternate remains available through /de mode.
   if d.clickModeVersion ~= 2 then d.clickMode, d.clickModeVersion = "macro", 2 end
 
-  if type(d.guards) ~= "table" then d.guards = {} end
-  for _, guard in ipairs(guards) do
-    if type(d.guards[guard.key]) ~= "boolean" then
-      d.guards[guard.key] = guard.key ~= "boe"
+  -- Observed yields: band key -> { n = disenchants, mats = { [itemID] =
+  -- { h = times it dropped, q = total quantity } } }.
+  if type(d.yields) ~= "table" then d.yields = {} end
+  for key, seen in pairs(d.yields) do
+    if type(key) ~= "number" or type(seen) ~= "table" or type(seen.n) ~= "number"
+        or type(seen.mats) ~= "table" then
+      d.yields[key] = nil
+    else
+      for id, m in pairs(seen.mats) do
+        if type(id) ~= "number" or type(m) ~= "table" or type(m.h) ~= "number"
+            or type(m.q) ~= "number" then
+          seen.mats[id] = nil
+        end
+      end
     end
   end
 
@@ -80,3 +106,17 @@ function Store.Get(guards, schemaVersion)
   end
   return cached
 end
+
+--- The per-character table. `own` says whether this character uses its own
+--- guard settings; until it does, the table holds nothing else.
+function Store.GetChar(guards)
+  if type(DisenchanterCharDB) ~= "table" then DisenchanterCharDB = {} end
+  if cachedChar ~= DisenchanterCharDB then
+    cachedChar = DisenchanterCharDB
+    cachedChar.own = cachedChar.own == true
+    if cachedChar.own then repairSettings(cachedChar, guards) end
+  end
+  return cachedChar
+end
+
+Store.RepairSettings = repairSettings
