@@ -19,7 +19,6 @@ local GetItemInfo         = GetItemInfo         or (C_Item and C_Item.GetItemInf
 local GetItemInfoInstant  = GetItemInfoInstant  or (C_Item and C_Item.GetItemInfoInstant)
 local GetItemSpell        = GetItemSpell        or (C_Item and C_Item.GetItemSpell)
 local GetInventoryItemLink = GetInventoryItemLink or (C_Item and C_Item.GetInventoryItemLink)
-local GetCoinTextureString = GetCoinTextureString or (C_CurrencyInfo and C_CurrencyInfo.GetCoinTextureString)
 local IsSpellKnown        = IsSpellKnown        or (C_SpellBook and C_SpellBook.IsSpellKnown)
 -- Blizzard's own deprecation maps IsPlayerSpell onto the "or overrides" variant.
 local IsPlayerSpell       = IsPlayerSpell       or (C_SpellBook and C_SpellBook.IsSpellKnownOrOverridesKnown)
@@ -201,17 +200,20 @@ local KEPT, KEPT_ALL = "on your keep list", "on your keep list (every version of
 --------------------------------------------------------------------------------
 -- Odds and ends the guards lean on.
 --------------------------------------------------------------------------------
-local function money(copper) return GetCoinTextureString(copper or 0) end
+--- Money is written "1g 2s 3c" rather than with coin textures: at list size
+--- the icons are blobs, letters take the colour of the text around them, and
+--- chat channels reject texture escapes anyway. This one is exact.
+local function money(copper)
+  copper = math.floor((copper or 0) + 0.5)
+  local g, s, c = math.floor(copper / 10000), math.floor(copper % 10000 / 100), copper % 100
+  local out = c > 0 and (c .. "c") or ""
+  if s > 0 then out = s .. "s" .. (out ~= "" and " " or "") .. out end
+  if g > 0 then out = g .. "g" .. (out ~= "" and " " or "") .. out end
+  return out ~= "" and out or "0c"
+end
 
 --- Money for a narrow column: from a gold upwards the copper is noise.
 local function shortMoney(copper)
-  copper = math.floor((copper or 0) + 0.5)
-  if copper >= 10000 then copper = copper - copper % 100 end
-  return GetCoinTextureString(copper)
-end
-
---- Money with no texture escapes, for chat channels (which reject them).
-local function plainMoney(copper)
   copper = math.floor((copper or 0) + 0.5)
   local g, s, c = math.floor(copper / 10000), math.floor(copper % 10000 / 100), copper % 100
   if g > 0 then return s > 0 and ("%dg %ds"):format(g, s) or ("%dg"):format(g) end
@@ -1159,8 +1161,8 @@ function DE.Split(args)
   end
   local worth, complete = runValue(totals, order)
   if worth then
-    lines[#lines + 1] = ("Estimated value: %s%s%s"):format(plainMoney(worth),
-      k > 1 and (" — about %s each"):format(plainMoney(worth / k)) or "",
+    lines[#lines + 1] = ("Estimated value: %s%s%s"):format(shortMoney(worth),
+      k > 1 and (" — about %s each"):format(shortMoney(worth / k)) or "",
       complete and "" or " (some materials unpriced)")
   end
 
@@ -1179,20 +1181,68 @@ end
 -- for its yield or the reason it was held back.
 --------------------------------------------------------------------------------
 local FALLBACK_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
-local PLUS   = "Interface\\Buttons\\UI-PlusButton-Up"
-local MINUS  = "Interface\\Buttons\\UI-MinusButton-Up"
 local LOCKED   = "Interface\\Buttons\\LockButton-Locked-Up"
 local UNLOCKED = "Interface\\Buttons\\LockButton-Unlocked-Up"
 
+-- Flat panels with a one-pixel edge, to match the flat buttons and tabs.
+local FLAT_EDGE = "Interface\\Buttons\\WHITE8x8"
 local function backdrop(f, alpha)
   f:SetBackdrop({
     bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 12,
-    insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    edgeFile = FLAT_EDGE,
+    tile = true, tileSize = 16, edgeSize = 1,
+    insets = { left = 1, right = 1, top = 1, bottom = 1 },
   })
   f:SetBackdropColor(0, 0, 0, alpha or 0.45)
-  f:SetBackdropBorderColor(0.5, 0.5, 0.5)
+  f:SetBackdropBorderColor(0.17, 0.18, 0.22, 1)
+end
+
+--- A scroll frame with a thin flat bar that appears only when there is
+--- something to scroll. Drawn here rather than inherited from the stock
+--- template, whose arrow buttons sit there even beside an empty list.
+--- `parent` holds both; the bar lives in a gutter SCROLL_GUTTER wide.
+local SCROLL_GUTTER = 10
+local function slimScroll(parent, name, pad)
+  local scroll = CreateFrame("ScrollFrame", name, parent)
+  scroll:SetPoint("TOPLEFT", pad, -pad)
+  scroll:SetPoint("BOTTOMRIGHT", -SCROLL_GUTTER, pad)
+  local bar = CreateFrame("Slider", nil, parent)
+  bar:SetOrientation("VERTICAL")
+  bar:EnableMouse(true)
+  bar:SetWidth(4)
+  bar:SetPoint("TOPRIGHT", -3, -pad)
+  bar:SetPoint("BOTTOMRIGHT", -3, pad)
+  local track = bar:CreateTexture(nil, "BACKGROUND")
+  track:SetAllPoints()
+  track:SetColorTexture(1, 1, 1, 0.05)
+  local thumb = bar:CreateTexture(nil, "ARTWORK")
+  thumb:SetColorTexture(0.42, 0.44, 0.52, 0.95)
+  thumb:SetSize(4, 32)
+  bar:SetThumbTexture(thumb)
+  bar:SetMinMaxValues(0, 0)
+  bar:SetValueStep(1)
+  bar:SetValue(0)
+  bar:Hide()
+  bar:SetScript("OnValueChanged", function(_, value) scroll:SetVerticalScroll(value) end)
+  scroll:EnableMouseWheel(true)
+  scroll:SetScript("OnMouseWheel", function(_, delta)
+    local _, top = bar:GetMinMaxValues()
+    top = tonumber(top) or 0
+    bar:SetValue(math.max(0, math.min(top, (tonumber(bar:GetValue()) or 0) - delta * 56)))
+  end)
+  scroll:SetScript("OnScrollRangeChanged", function(self, _, range)
+    range = math.floor((tonumber(range) or tonumber(self:GetVerticalScrollRange()) or 0) + 0.5)
+    bar:SetMinMaxValues(0, range)
+    if (tonumber(bar:GetValue()) or 0) > range then bar:SetValue(range) end
+    -- The thumb covers the share of the list that is on screen.
+    local view = tonumber(self:GetHeight()) or 0
+    if range > 0 and view > 0 then
+      thumb:SetHeight(math.max(18, view * view / (view + range)))
+    end
+    bar:SetShown(range > 0)
+  end)
+  scroll.bar = bar
+  return scroll
 end
 
 local function tipHide() GameTooltip:Hide() end
@@ -1509,15 +1559,17 @@ local function headerRow(i)
   row.bg:SetAllPoints()
   row.bg:SetColorTexture(0.12, 0.12, 0.14, 0.92)
   row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
-  row.toggle = row:CreateTexture(nil, "ARTWORK")
-  row.toggle:SetSize(14, 14)
-  row.toggle:SetPoint("LEFT", 0, 0)
+  -- A plain +/- rather than the stock red plus-button art.
+  row.toggle = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  row.toggle:SetWidth(14)
+  row.toggle:SetPoint("LEFT", 2, 0)
+  row.toggle:SetJustifyH("CENTER")
   -- What the section adds up to, where there is something to add up.
   row.right = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   row.right:SetPoint("RIGHT", -6, 0)
   -- The title gives way to it: a long run name truncates instead of colliding.
   row.text = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  row.text:SetPoint("LEFT", row.toggle, "RIGHT", 4, 0)
+  row.text:SetPoint("LEFT", row.toggle, "RIGHT", 3, 0)
   row.text:SetPoint("RIGHT", row.right, "LEFT", -6, 0)
   row.text:SetJustifyH("LEFT")
   row.text:SetWordWrap(false)
@@ -1533,7 +1585,7 @@ end
 local function placeHead(hi, y, key, text, right)
   local head = headerRow(hi)
   head.key = key
-  head.toggle:SetTexture(isCollapsed(key) and PLUS or MINUS)
+  head.toggle:SetText(isCollapsed(key) and "+" or "\226\128\147")
   head.text:SetText(text)
   head.right:SetText(right or "")
   head:ClearAllPoints()
@@ -1565,15 +1617,23 @@ local TEXT_LEFT = 34   -- past the icon
 local LOCK_PAD  = 26   -- the padlock and its margins
 local VALUE_COL = 72   -- the right-hand figure column, when a row has one
 
---- Lay out a row's text against whatever sits on its right: `pad` is the
---- width taken by the padlock / Allow button, `column` whether the value
---- column is in use. Regions only — safe to call on a secure row.
-local function rowInsets(row, pad, column)
+--- Lay out a row's right-hand side. `right` is what sits at the far edge
+--- (the padlock on list rows, a margin on the others). The figure column
+--- comes next and never moves, so figures line up down the list; an Allow /
+--- Restore button (`allowW`, 0 for none) sits to its left, or in its place
+--- when the row has no figure (`column`). Regions only — safe to call on a
+--- secure row.
+local function rowInsets(row, right, allowW, column)
+  local figures = column and (VALUE_COL + 4) or 0
   row.value:ClearAllPoints()
-  row.value:SetPoint("TOPRIGHT", -pad, -4)
+  row.value:SetPoint("TOPRIGHT", -right, -4)
   row.tag:ClearAllPoints()
-  row.tag:SetPoint("TOPRIGHT", -pad, -16)
-  local inset = pad + (column and VALUE_COL or 0) + 4
+  row.tag:SetPoint("TOPRIGHT", -right, -16)
+  if row.allow then
+    row.allow:ClearAllPoints()
+    row.allow:SetPoint("RIGHT", -(right - 1 + figures), 0)
+  end
+  local inset = right + figures + (allowW > 0 and (allowW + 5) or 0) + 4
   row.name:ClearAllPoints()
   row.name:SetPoint("TOPLEFT", TEXT_LEFT, -4)
   row.name:SetPoint("TOPRIGHT", -inset, -4)
@@ -1631,16 +1691,20 @@ local function itemRow(i)
   end)
   row.lock:SetScript("OnEnter", function(self)
     local it = self:GetParent().item
+    self:SetAlpha(1)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:SetText(it and keptAs(it)
       and "On your keep list — click to remove"
       or "Click to never disenchant this item", 1, 1, 1)
     GameTooltip:Show()
   end)
-  row.lock:SetScript("OnLeave", tipHide)
+  row.lock:SetScript("OnLeave", function(self)
+    self:SetAlpha(self.kept and 1 or 0.55)
+    GameTooltip:Hide()
+  end)
 
   row.allow = flatButton(row, "Allow", 46, 18)
-  row.allow:SetPoint("RIGHT", row.lock, "LEFT", -3, 0)
+  row.allow:SetPoint("RIGHT", -(LOCK_PAD - 1), 0) -- rowInsets places it for real
   row.allow:SetScript("OnClick", function(self)
     local it = self:GetParent().item
     if not it then return end
@@ -1679,7 +1743,7 @@ local function itemRow(i)
   row.value:SetJustifyH("RIGHT")
   row.tag = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   row.tag:SetJustifyH("RIGHT")
-  rowInsets(row, LOCK_PAD, false)
+  rowInsets(row, LOCK_PAD, 0, false)
 
   row:SetScript("OnEnter", function(self)
     local it = self.item
@@ -1800,7 +1864,7 @@ local function placeInfo(ri, y, tint, link, nameText, noteText, valueText, icon)
   row.note:SetText(noteText or "")
   row.value:SetText(valueText or "")
   row.tag:SetText("")
-  rowInsets(row, 6, (valueText or "") ~= "")
+  rowInsets(row, 6, 0, (valueText or "") ~= "")
   row.castFill:Hide()
   row.lock:Hide()
   row.allow:Hide()
@@ -1827,17 +1891,28 @@ local function statusText(safe, confirm, blocked)
     return "|cffff5555In combat|r — the list is frozen until you leave it."
   end
   local skill = enchantingSkill()
-  if not knowsDisenchant() then
-    return ("|cff33cc44%d safe|r, |cffffd100%d to check|r, |cffff5555%d protected|r   |cffff5555no Disenchant on this character|r")
-      :format(#safe, #confirm, #blocked)
+  -- A count of zero is muted, so an empty bag isn't a traffic light of zeros.
+  local function count(n, colour, what)
+    return ("%s%d %s|r"):format(n > 0 and colour or "|cff666666", n, what)
   end
-  return ("|cff33cc44%d safe|r, |cffffd100%d to check|r, |cffff5555%d protected|r%s")
-    :format(#safe, #confirm, #blocked, skill and ("   |cff888888Enchanting " .. skill .. "|r") or "")
+  local counts = count(#safe, "|cff33cc44", "safe") .. "|cff666666  \194\183  |r"
+    .. count(#confirm, "|cffffd100", "to check") .. "|cff666666  \194\183  |r"
+    .. count(#blocked, "|cffff5555", "protected")
+  if not knowsDisenchant() then
+    return counts .. "   |cffff5555no Disenchant on this character|r"
+  end
+  return counts .. (skill and ("   |cff888888Enchanting " .. skill .. "|r") or "")
 end
 
+--- Gains are green. A loss is only red once it passes the /de loss
+--- threshold; below that it is muted, so a list of items that each give up a
+--- few copper isn't a column of alarms and the real losses stand out.
 local function profitText(profit)
   if not profit then return "" end
-  return (profit >= 0 and "|cff55bb66+" or "|cffff6666-") .. shortMoney(math.abs(profit)) .. "|r"
+  if profit >= 0 then return "|cff55bb66+" .. shortMoney(profit) .. "|r" end
+  local limit = cfg().lossSilver * 100
+  return ((limit > 0 and -profit <= limit) and "|cffa08888-" or "|cffff6666-")
+    .. shortMoney(-profit) .. "|r"
 end
 
 function DE.Refresh()
@@ -1888,7 +1963,8 @@ function DE.Refresh()
     and "Click a row to delete it forever — Ctrl-click a white item."
     or "Click a green row to disenchant it — Ctrl-click an amber one.")
   win.empty:SetText(filterText ~= "" and ("No items match “" .. filterText .. "”")
-    or (trash and "No junk in your bags" or "Nothing disenchantable in your bags"))
+    or (trash and "No junk in your bags"
+      or "Nothing to disenchant\n|cff5f6068Uncommon or better gear in your bags is listed here.|r"))
 
   win.castingRow = nil
   -- Without Disenchant a row has nothing safe to do: leave it unarmed rather
@@ -1906,11 +1982,14 @@ function DE.Refresh()
     if b.key ~= "blocked" then
       for _, it in ipairs(list) do sum = sum + ((trash and it.vendor or it.deValue) or 0) end
     end
-    hi = hi + 1
-    y = placeHead(hi, y, ck, ("%s%s|r  |cff888888(%d)|r"):format(b.color, b.title, #list),
-      sum > 0 and ((trash and "forfeits " or "materials ~") .. shortMoney(sum)) or "")
+    -- An empty section draws nothing: a "(0)" header is only noise.
+    if #list > 0 then
+      hi = hi + 1
+      y = placeHead(hi, y, ck, ("%s%s|r  |cff888888(%d)|r"):format(b.color, b.title, #list),
+        sum > 0 and ((trash and "forfeits " or "est. materials ") .. shortMoney(sum)) or "")
+    end
 
-    if not isCollapsed(ck) then
+    if #list > 0 and not isCollapsed(ck) then
       for _, it in ipairs(list) do
         ri = ri + 1
         local row = itemRow(ri)
@@ -1961,14 +2040,21 @@ function DE.Refresh()
         row.castFill:SetShown(it.casting and true or false)
         if it.casting then win.castingRow = row end
         row.lock:Show() -- the Run Split and History tabs hide it
-        row.lock:SetNormalTexture(keptAs(it) and LOCKED or UNLOCKED)
+        -- An open padlock is an offer, not a state: draw it faint and grey so
+        -- the column is quiet until something is actually kept.
+        local kept = keptAs(it) and true or false
+        row.lock.kept = kept
+        row.lock:SetNormalTexture(kept and LOCKED or UNLOCKED)
+        local lockArt = row.lock:GetNormalTexture()
+        if lockArt and lockArt.SetDesaturated then lockArt:SetDesaturated(not kept) end
+        row.lock:SetAlpha(kept and 1 or 0.55)
         local override = allowed[keyOf(it)]
         local showAllow = (it.tier == "blocked" and not it.permanent) or override
         local allowW = override and 54 or 46
         row.allow:SetText(override and "Restore" or "Allow")
         row.allow:SetWidth(allowW)
         row.allow:SetShown(showAllow and true or false)
-        rowInsets(row, LOCK_PAD + (showAllow and (allowW + 5) or 0), figure ~= "" or tag ~= "")
+        rowInsets(row, LOCK_PAD, showAllow and allowW or 0, figure ~= "" or tag ~= "")
 
         if trash then
           armTrash(row, it.tier, it.bag, it.slot)
@@ -2031,7 +2117,7 @@ function DE.RefreshSplit()
   local hi, ri, y = 1, 0, 0
   y = placeHead(hi, y, "runmats",
     ("|cff33cc44MATERIALS THIS RUN|r  |cff888888(%d)|r"):format(#order),
-    worth and ("worth ~" .. shortMoney(worth) .. (complete and "" or "+")) or "")
+    worth and ("est. worth " .. shortMoney(worth) .. (complete and "" or "+")) or "")
   if not isCollapsed("runmats") then
     for _, out in ipairs(order) do
       local total = totals[out]
@@ -2088,7 +2174,7 @@ function DE.RefreshSplit()
   local split = "   |cff888888not in a group|r"
   if k > 1 then
     split = (" — |cff33cc44split %d ways|r%s"):format(k,
-      worth and (", ~" .. shortMoney(worth / k) .. " each") or "")
+      worth and (", about " .. shortMoney(worth / k) .. " each") or "")
   end
   win.status:SetText(("Run since |cffffd100%s|r — %d drop%s%s"):format(sinceLabel,
     drops, drops == 1 and "" or "s", split))
@@ -2112,7 +2198,7 @@ function DE.RefreshHistory()
     y = placeHead(hi, y, key, ("|cffb37ce8%s|r  |cff888888%s — %d drop%s|r"):format(
       run.name or "Run", date("%d %b %Y %H:%M", run.start), run.drops or 0,
       run.drops == 1 and "" or "s"),
-      type(run.value) == "number" and ("was ~" .. shortMoney(run.value)) or "")
+      type(run.value) == "number" and ("was about " .. shortMoney(run.value)) or "")
     if not isCollapsed(key) then
       local members = run.members or {}
       ri = ri + 1
@@ -2160,13 +2246,11 @@ local function ensureOptions(parent)
   o:Hide()
   o.checks, o.boxes = {}, {}
 
-  local scroll = CreateFrame("ScrollFrame", "DisenchanterOptionsScroll", o, "UIPanelScrollFrameTemplate")
-  scroll:SetPoint("TOPLEFT", 6, -6)
-  scroll:SetPoint("BOTTOMRIGHT", -27, 6)
+  local scroll = slimScroll(o, "DisenchanterOptionsScroll", 6)
   local c = CreateFrame("Frame", nil, scroll)
   c:SetSize(ROW_W - 10, 1)
   scroll:SetScrollChild(c)
-  o:SetScript("OnSizeChanged", function(self) c:SetWidth(math.max(1, self:GetWidth() - 38)) end)
+  o:SetScript("OnSizeChanged", function(self) c:SetWidth(math.max(1, self:GetWidth() - 10 - SCROLL_GUTTER)) end)
 
   local y = 0
   local function section(title, sub)
@@ -2364,12 +2448,12 @@ local function ensureWindow()
   end
   f:SetBackdrop({
     bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 8,
-    insets = { left = 2, right = 2, top = 2, bottom = 2 },
+    edgeFile = FLAT_EDGE,
+    tile = true, tileSize = 16, edgeSize = 1,
+    insets = { left = 1, right = 1, top = 1, bottom = 1 },
   })
   f:SetBackdropColor(0.035, 0.04, 0.05, 0.97)
-  f:SetBackdropBorderColor(0.20, 0.22, 0.25, 1)
+  f:SetBackdropBorderColor(0, 0, 0, 1)
   f:SetMovable(true)
   f:SetResizable(true)
   if f.SetResizeBounds then f:SetResizeBounds(MIN_W, MIN_H, MAX_W, MAX_H)
@@ -2478,16 +2562,17 @@ local function ensureWindow()
   inset:SetPoint("TOPLEFT", 5, -64)
   inset:SetPoint("BOTTOMRIGHT", -5, 34)
   backdrop(inset, 0.55)
-  local scroll = CreateFrame("ScrollFrame", "DisenchanterScroll", inset, "UIPanelScrollFrameTemplate")
-  scroll:SetPoint("TOPLEFT", 5, -5)
-  scroll:SetPoint("BOTTOMRIGHT", -27, 5)
+  local scroll = slimScroll(inset, "DisenchanterScroll", 4)
   local content = CreateFrame("Frame", nil, scroll)
   content:SetSize(ROW_W, 1)
   scroll:SetScrollChild(content)
   win.content = content
-  win.empty = inset:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  win.empty:SetPoint("CENTER")
-  win.empty:SetText("Nothing disenchantable in your bags")
+  win.empty = inset:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+  win.empty:SetPoint("LEFT", 24, 0)
+  win.empty:SetPoint("RIGHT", -24, 0)
+  win.empty:SetJustifyH("CENTER")
+  win.empty:SetSpacing(4)
+  win.empty:SetText("Nothing to disenchant")
 
   -- The options tab sits over the list and the footer, so it has to win on
   -- frame level.
@@ -2508,19 +2593,31 @@ local function ensureWindow()
   simpleTip(report, "Print to chat", "Lists every item and its verdict in your chat window. Only you see it.")
   win.rescan, win.report = rescan, report
 
-  local search = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
-  search:SetHeight(20)
-  search:SetPoint("BOTTOMLEFT", 140, 7)
-  search:SetPoint("BOTTOMRIGHT", -164, 7)
+  -- Drawn flat like the buttons beside it, not from InputBoxTemplate.
+  local search = CreateFrame("EditBox", nil, f)
+  search:SetHeight(22)
+  search:SetPoint("BOTTOMLEFT", 130, 6)
+  search:SetPoint("BOTTOMRIGHT", -160, 6)
+  search:SetFontObject("GameFontHighlightSmall")
   search:SetAutoFocus(false)
   search:SetMaxLetters(40)
-  search:SetTextInsets(2, 6, 0, 0)
+  search:SetTextInsets(6, 6, 0, 0)
+  search.edge = search:CreateTexture(nil, "BACKGROUND")
+  search.edge:SetAllPoints()
+  search.edge:SetColorTexture(0.26, 0.28, 0.33, 1)
+  local searchBg = search:CreateTexture(nil, "BORDER")
+  searchBg:SetPoint("TOPLEFT", 1, -1)
+  searchBg:SetPoint("BOTTOMRIGHT", -1, 1)
+  searchBg:SetColorTexture(0.045, 0.05, 0.065, 1)
   -- A placeholder, so an empty box says what it is for.
   search.placeholder = search:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-  search.placeholder:SetPoint("LEFT", 3, 0)
+  search.placeholder:SetPoint("LEFT", 6, 0)
   search.placeholder:SetText("Filter")
   local function placeholderState(self)
-    self.placeholder:SetShown(self:GetText() == "" and not self:HasFocus())
+    local focus = self:HasFocus()
+    self.placeholder:SetShown(self:GetText() == "" and not focus)
+    if focus then self.edge:SetColorTexture(0.62, 0.36, 0.86, 1)
+    else self.edge:SetColorTexture(0.26, 0.28, 0.33, 1) end
   end
   search:HookScript("OnEditFocusGained", placeholderState)
   search:HookScript("OnEditFocusLost", placeholderState)
@@ -2611,12 +2708,38 @@ local function ensureWindow()
   grip:SetPoint("BOTTOMRIGHT", 0, 0)
   grip:SetFrameLevel(f:GetFrameLevel() + 30)
   grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
-  grip:SetScript("OnMouseDown", function() f:StartSizing("BOTTOMRIGHT") end)
-  grip:SetScript("OnMouseUp", function()
-    f:StopMovingOrSizing()
-    db().panel.w, db().panel.h = math.floor(f:GetWidth() + 0.5), math.floor(f:GetHeight() + 0.5)
+  grip:SetScript("OnMouseDown", function()
+    -- The window is protected, so it can't be re-anchored or sized in combat.
+    if InCombatLockdown() then return end
+    -- Sizing from BOTTOMRIGHT assumes TOPLEFT stays put, but the window hangs
+    -- by whatever point the last drag left it on (CENTER on a fresh install).
+    -- Size it from there and a bare click on the grip makes it jump: re-pin
+    -- the top-left corner first.
+    local left, top = f:GetLeft(), f:GetTop()
+    if type(left) == "number" and type(top) == "number" then
+      f:ClearAllPoints()
+      f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left, top)
+    end
+    f.sizing = true
+    f:StartSizing("BOTTOMRIGHT")
   end)
-  local function resizeContent(self) content:SetWidth(math.max(1, self:GetWidth() - 42)) end
+  grip:SetScript("OnMouseUp", function()
+    if not f.sizing then return end
+    f.sizing = nil
+    f:StopMovingOrSizing()
+    local panel = db().panel
+    panel.w, panel.h = math.floor(f:GetWidth() + 0.5), math.floor(f:GetHeight() + 0.5)
+    -- The re-pin changed the anchor, so the saved place has to follow it.
+    local point, _, relativePoint, x, y = f:GetPoint()
+    if type(point) == "string" then
+      panel.point, panel.relativePoint, panel.x, panel.y = point, relativePoint, x, y
+    end
+  end)
+  win.grip = grip
+  -- Window, less the inset's margins, the list's left pad and the bar gutter.
+  local function resizeContent(self)
+    content:SetWidth(math.max(1, self:GetWidth() - 14 - SCROLL_GUTTER))
+  end
   f:SetScript("OnSizeChanged", resizeContent)
   resizeContent(f)
 
@@ -2668,7 +2791,7 @@ function DE.SetTab(tab)
   -- The filter stretches into the corner the Next button leaves free.
   -- In combat the button can't be hidden, so it keeps its corner until after.
   local corner = tab == "de" or (InCombatLockdown() and f.next:IsShown())
-  f.search:SetPoint("BOTTOMRIGHT", corner and -164 or -24, 7)
+  f.search:SetPoint("BOTTOMRIGHT", corner and -160 or -20, 6)
   f.newRun:SetShown(tab == "split")
   f.announce:SetShown(tab == "split")
   f.opts:SetShown(tab == "options")

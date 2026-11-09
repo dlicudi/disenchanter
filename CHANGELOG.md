@@ -22,9 +22,18 @@
   section totals in the headers, a placeholder in the filter box, and a
   scrolling Settings tab organised into sections. The minimum window width is
   now 380.
+- Interface: one-pixel flat borders, a flat filter box, a thin scrollbar that
+  appears only when the list overflows, and plain +/- section toggles. Empty
+  sections no longer draw a "(0)" header, and zero counts in the summary line
+  are muted. The padlock is faint until an item is actually on the keep list.
+- Money is written as `4s 84c` instead of with coin icons, in the window,
+  tooltips and chat.
 - Rows and the Next button now cast with `/cast [nocombat] Disenchant`, so a
   button left armed when combat starts refuses on its own. (`/de mode spell`
   cannot carry the condition and still relies on the game refusing the cast.)
+- Fixed: clicking the resize grip made the window jump in size. It hung by
+  whatever point the last drag left it on; it is now pinned by its top-left
+  corner before sizing.
 - Fixed: pressing Escape in the filter box emptied the box but left the list
   filtered.
 - Rows now hold their position while the window is open: a bag update no longer

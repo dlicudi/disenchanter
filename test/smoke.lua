@@ -345,4 +345,27 @@ step("active disenchant row becomes a secure cancel button",function()
   assert(row.cancelCast==true)
   DE._arm(row,"safe",2,3);assert(row.cancelCast==nil)
 end)
+step("empty sections draw no header and an empty list shows only the message",function()
+  local w=DE._window();if not w:IsShown() then w:Show() end
+  local function shownHeads()local n=0;for _,h in ipairs(w.heads)do if h:IsShown()then n=n+1 end end;return n end
+  DE.SetTab("de");assert(shownHeads()==0 and w.empty:IsShown())
+  withBags({{itemID=11},{itemID=13}},function()
+    DE.SetTab("de");assert(shownHeads()==1 and not w.empty:IsShown()) -- Safe only: no "(0)" headers
+  end)
+end)
+step("the resize grip pins the top-left corner before sizing, and not in combat",function()
+  local w=DE._window();local calls={}
+  w.GetLeft=function()return 100 end;w.GetTop=function()return 700 end
+  w.ClearAllPoints=function()calls[#calls+1]="clear" end
+  w.SetPoint=function(_,point,_,rel,x,y)calls[#calls+1]=point..">"..rel..":"..x..","..y end
+  w.StartSizing=function(_,corner)calls[#calls+1]="size "..corner end
+  w.GetPoint=function()return "TOPLEFT",nil,"BOTTOMLEFT",100,700 end
+  IN_COMBAT=true;w.grip:GetScript("OnMouseDown")();assert(#calls==0)
+  w.grip:GetScript("OnMouseUp")();assert(DisenchanterDB.panel.point~="TOPLEFT" or DisenchanterDB.panel.x~=100)
+  IN_COMBAT=false;w.grip:GetScript("OnMouseDown")()
+  assert(table.concat(calls," | ")=="clear | TOPLEFT>BOTTOMLEFT:100,700 | size BOTTOMRIGHT")
+  w.grip:GetScript("OnMouseUp")()
+  local p=DisenchanterDB.panel;assert(p.point=="TOPLEFT" and p.relativePoint=="BOTTOMLEFT" and p.x==100 and p.y==700)
+  assert(p.w==380 and p.h==460)
+end)
 print(("%d steps, %d failed"):format(steps,failed));if failed>0 then os.exit(1)end
