@@ -137,6 +137,58 @@ local allowed = {}
 local filterText = ""
 
 --------------------------------------------------------------------------------
+-- Item identity. An item id alone is not an item: "Notched Shortsword of
+-- Magic" and "... of Healing" share one id and differ only in the link. Older
+-- clients carry the difference in the suffix field (7th); the 1.60 client
+-- leaves that empty and uses bonus ids instead (a count in the 13th field,
+-- then the ids). The fields in between — unique id, link level, spec — vary
+-- per copy or per character without changing what the item is, so they stay
+-- out of the key, as do enchants and gems: a kept sword is still kept after
+-- you enchant it.
+--------------------------------------------------------------------------------
+--- @return the bare item id (a number) for a plain item, or "id:suffix:bonus.bonus"
+local function itemKey(link, itemID)
+  local body = type(link) == "string" and link:match("item:([^|]+)")
+  if not body then return itemID end
+  local f = {}
+  for field in (body .. ":"):gmatch("([^:]*):") do f[#f + 1] = field end
+  local id = tonumber(f[1]) or itemID
+  local suffix = tonumber(f[7]) or 0
+  local bonus = {}
+  for i = 14, 13 + (tonumber(f[13]) or 0) do
+    local b = tonumber(f[i])
+    if b then bonus[#bonus + 1] = b end
+  end
+  if suffix == 0 and #bonus == 0 then return id end
+  table.sort(bonus)
+  return ("%s:%d:%s"):format(tostring(id), suffix, table.concat(bonus, "."))
+end
+
+--- The name as the link spells it, suffix included. GetItemInfo(itemID) only
+--- ever knows the base name.
+local function linkName(link)
+  return type(link) == "string" and link:match("|h%[(.-)%]|h") or nil
+end
+
+local function keyOf(it) return it.key or it.itemID end
+
+--- Is this item on the keep list? An exact entry (what the padlock writes)
+--- wins; a bare item id — `/de keep #727`, or a padlock from before variants
+--- were told apart — covers every version of that item. Erring that way round
+--- means an old entry never silently stops protecting something.
+--- @return the matching keep-list key, and true when it was the bare-id entry
+---         standing in for a variant
+local function keptAs(it)
+  local items = db().keep.items
+  local key = keyOf(it)
+  if items[key] then return key, false end
+  if key ~= it.itemID and items[it.itemID] then return it.itemID, true end
+  return nil
+end
+
+local KEPT, KEPT_ALL = "on your keep list", "on your keep list (every version of this item)"
+
+--------------------------------------------------------------------------------
 -- Odds and ends the guards lean on.
 --------------------------------------------------------------------------------
 local function money(copper) return GetCoinTextureString(copper or 0) end
@@ -279,7 +331,8 @@ local function verdict(it, skill)
   local d = db()
   local g = d.guards
 
-  if d.keep.items[it.itemID] then return "blocked", "on your keep list", true end
+  local kept, everyVersion = keptAs(it)
+  if kept then return "blocked", everyVersion and KEPT_ALL or KEPT, true end
   for _, n in ipairs(d.keep.names) do
     if n ~= "" and it.name:lower():find(n:lower(), 1, true) then
       return "blocked", 'keep list: "' .. n .. '"', true
@@ -290,7 +343,7 @@ local function verdict(it, skill)
     return "blocked", ("needs Enchanting %d (you have %d)"):format(it.skillNeeded, skill), true
   end
 
-  if not allowed[it.itemID] then
+  if not allowed[keyOf(it)] then
     if g.quest and it.isQuest then return "blocked", "quest item" end
     if g.relic and it.isRelic then return "blocked", "relic — idol / libram / totem" end
     if g.set and it.setID then return "blocked", "part of an item set" end
@@ -342,7 +395,9 @@ function DE.Scan()
           local deValue = expectedDisenchantValue(quality, ilvl)
           local it = {
             bag = bag, slot = slot, itemID = info.itemID,
-            name = name, link = info.hyperlink or link, icon = info.iconFileID,
+            key = itemKey(info.hyperlink, info.itemID),
+            name = linkName(info.hyperlink) or name,
+            link = info.hyperlink or link, icon = info.iconFileID,
             quality = quality, ilvl = ilvl, count = info.stackCount or 1,
             yield = yield, skillNeeded = skillNeeded,
             value = value, valueSrc = valueSrc,
@@ -398,13 +453,14 @@ local NEVER_DELETE = {
 
 local function trashVerdict(it)
   local d = db()
-  if d.keep.items[it.itemID] then return "blocked", "on your keep list", true end
+  local kept, everyVersion = keptAs(it)
+  if kept then return "blocked", everyVersion and KEPT_ALL or KEPT, true end
   for _, n in ipairs(d.keep.names) do
     if n ~= "" and it.name:lower():find(n:lower(), 1, true) then
       return "blocked", 'keep list: "' .. n .. '"', true
     end
   end
-  if not allowed[it.itemID] then
+  if not allowed[keyOf(it)] then
     if d.guards.quest and it.isQuest then return "blocked", "quest item" end
     -- The value guard bites harder here than on the disenchant tab: deleting
     -- a stack of cloth is pure loss, so a valuable stack is Protected, not
@@ -432,7 +488,9 @@ function DE.ScanTrash()
           local value, valueSrc = valueOf(info.itemID, sellPrice, count)
           local it = {
             bag = bag, slot = slot, itemID = info.itemID,
-            name = name, link = info.hyperlink or link, icon = info.iconFileID,
+            key = itemKey(info.hyperlink, info.itemID),
+            name = linkName(info.hyperlink) or name,
+            link = info.hyperlink or link, icon = info.iconFileID,
             quality = quality, count = count,
             isBound = info.isBound,
             vendor = (sellPrice or 0) * count,
@@ -498,7 +556,7 @@ end
 DE.tally = {}
 local lastDE = 0
 local lastDESource -- link of the item the completed cast consumed
-local sessionStart = time() -- fallback split marker: since login
+local sessionStart = time() -- fallback split marker: since login; see resumeSession
 local AUDIT_MAX = 300
 
 -- Disenchant outputs on the supported Era/TBC-family clients. Restricting the
@@ -531,6 +589,38 @@ local function isSelfLoot(msg)
   return false
 end
 
+-- "Since login" has to mean since you sat down, not since the client last
+-- loaded the UI: a /reload or a dropped connection mid-dungeon must not wipe
+-- the run. So the session start is saved, and a login that follows the last
+-- sign of life by less than SESSION_GRACE picks the old session back up.
+-- Half an hour is how long an instance waits for you before it resets.
+--
+-- `lastSeen` is stamped on every event the addon receives (see the event
+-- handler) rather than only on PLAYER_LOGOUT, so it is still recent if the
+-- connection drops without a clean logout. What can't be survived is the
+-- client itself dying: saved variables are only written on a clean UI
+-- shutdown, so a crash loses everything since the previous save.
+local SESSION_GRACE = 30 * 60
+local sessionLive = false
+
+local function resumeSession()
+  local d = db()
+  local now = time()
+  local resumed = d.sessionStart and d.lastSeen
+    and d.sessionStart <= now and now - d.lastSeen <= SESSION_GRACE
+  if not resumed then d.sessionStart = now end
+  d.lastSeen = now
+  sessionStart = d.sessionStart
+  sessionLive = true
+  -- The tally is "this session" too; rebuild it from the audit so it agrees.
+  DE.tally = {}
+  for _, e in ipairs(d.audit) do
+    if e.t >= sessionStart and not e.del then
+      DE.tally[e.out] = (DE.tally[e.out] or 0) + e.n
+    end
+  end
+end
+
 --- `deleted` marks a Trash-tab deletion: it shows in /de audit like anything
 --- else, but /de split skips it — a destroyed grey is nobody's shard.
 local function auditAppend(src, out, count, deleted)
@@ -549,7 +639,9 @@ end
 local function noteLoot(msg)
   if GetTime() - lastDE > 3 then return end
   if not isSelfLoot(msg) then return end
-  local link, count = msg:match("(|c%x+|Hitem:.-|h.-|h|r)%s*x?(%d*)")
+  -- The colour escape is "|cff1eff00" on older clients and "|cnIQ2:" on 1.60;
+  -- match whatever sits between "|c" and the link rather than assume hex.
+  local link, count = msg:match("(|c[^|]*|Hitem:.-|h.-|h|r)%s*x?(%d*)")
   if not link then return end
   local itemID = tonumber(link:match("|Hitem:(%d+)"))
   local isMaterial = itemID and ENCHANT_MATERIAL[itemID]
@@ -657,15 +749,25 @@ end
 --- Materials produced since `since`, straight out of the audit: totals keyed
 --- by output link, the order each first appeared, and how many loot lines
 --- that covered. Trash-tab deletions are skipped — a destroyed grey is
---- nobody's shard. Shared by /de split and the window's Run tab, so the two
+--- nobody's shard. Shared by /de split and the window's Run Split tab, so the two
 --- can never disagree.
+---
+--- Links embed your character level, so the same dust looted either side of a
+--- level-up arrives as two different strings. Totals are grouped by item id
+--- and shown under the first link seen.
 local function runTotals(since)
-  local totals, order, drops = {}, {}, 0
+  local totals, order, drops, firstLink = {}, {}, 0, {}
   for _, e in ipairs(db().audit) do
     if e.t >= since and not e.del then
       drops = drops + 1
-      if not totals[e.out] then order[#order + 1] = e.out end
-      totals[e.out] = (totals[e.out] or 0) + e.n
+      local id = e.out:match("item:(%d+)") or e.out
+      local out = firstLink[id]
+      if not out then
+        out = e.out
+        firstLink[id] = out
+        order[#order + 1] = out
+      end
+      totals[out] = (totals[out] or 0) + e.n
     end
   end
   return totals, order, drops
@@ -689,13 +791,19 @@ end
 local RUN_HISTORY_MAX = 20
 
 --- Freeze the current run into a compact summary independent of the capped
---- audit log. Returns false when the marker has no material drops yet.
+--- audit log. "Current run" is exactly what the Run Split tab is showing: from
+--- the marker, or from login when no marker was ever set — otherwise the first
+--- New run of a session would discard everything on screen. Returns false when
+--- there are no material drops to save.
+---
+--- Callers must move the marker to now afterwards (startRun does), so the
+--- same drops can never be archived a second time.
 local function archiveCurrentRun(name)
   local d = db()
-  if not d.splitStart then return false end
-  local totals, order, drops = runTotals(d.splitStart)
+  local since = d.splitStart or sessionStart
+  local totals, order, drops = runTotals(since)
   if drops == 0 then return false end
-  local saved = { start = d.splitStart, finish = time(), drops = drops,
+  local saved = { start = since, finish = time(), drops = drops,
     name = name or d.runName or ((GetRealZoneText and GetRealZoneText()) or "Run"),
     members = roster(), totals = {} }
   for _, out in ipairs(order) do
@@ -706,11 +814,14 @@ local function archiveCurrentRun(name)
   return true
 end
 
+--- Archive whatever the current run holds, then start counting from now.
+--- @return true when a run was archived
 local function startRun(name)
   local d = db()
-  archiveCurrentRun()
+  local archived = archiveCurrentRun()
   d.splitStart = time()
   d.runName = name and name ~= "" and name or nil
+  return archived
 end
 
 function DE.RunHistory(args)
@@ -724,9 +835,11 @@ function DE.RunHistory(args)
     pr("current run named |cffffd100" .. value .. "|r.")
     return
   elseif op == "end" then
+    -- Ending leaves a fresh marker rather than none: with no marker the split
+    -- falls back to "since login" and would show the archived drops again.
     if archiveCurrentRun() then
-      d.splitStart, d.runName = nil, nil
-      pr("run archived.")
+      d.splitStart, d.runName = time(), nil
+      pr("run archived — it's on the History tab. Counting starts again from now.")
     else
       pr("the current run has no disenchant drops to archive.")
     end
@@ -760,8 +873,9 @@ function DE.Split(args)
   local d = db()
   args = args:lower()
   if args == "start" then
-    startRun()
-    pr("split marker set — |cffffd100/de split|r now totals everything from this moment.")
+    local archived = startRun()
+    pr((archived and "previous run archived; " or "")
+      .. "split marker set — |cffffd100/de split|r now totals everything from this moment.")
     return
   end
   local channel = (args == "say" and "SAY")
@@ -839,12 +953,12 @@ local function tipHide() GameTooltip:Hide() end
 --------------------------------------------------------------------------------
 local win
 local pendingToggle, pendingTab, pendingShow = false, nil, false
-local WIN_W, WIN_H = 380, 430
-local MIN_W, MIN_H = 340, 420 -- tall enough for the fixed options drawer
+local WIN_W, WIN_H = 410, 460
+local MIN_W, MIN_H = 360, 420 -- tall enough for the fixed options drawer
 local MAX_W, MAX_H = 620, 760
-local ROW_W  = 342 -- initial width; resized rows are anchored to both edges
-local ROW_H  = 30
-local HEAD_H = 20
+local ROW_W  = 372 -- initial width; resized rows are anchored to both edges
+local ROW_H  = 28
+local HEAD_H = 18
 
 local function rowWidth()
   if win and win.content and win.content.GetWidth then
@@ -855,17 +969,17 @@ local function rowWidth()
 end
 
 local BUCKETS = {
-  { key = "safe",    title = "[OK] Safe to disenchant", color = "|cff33cc44" },
-  { key = "confirm", title = "[CHECK] Check first",     color = "|cffffd100" },
-  { key = "blocked", title = "[LOCKED] Protected",      color = "|cffff5555" },
+  { key = "safe",    title = "SAFE TO DISENCHANT", color = "|cff55c96b" },
+  { key = "confirm", title = "REVIEW FIRST",       color = "|cffd7ad45" },
+  { key = "blocked", title = "PROTECTED",          color = "|cffb96a6a" },
 }
 
 -- The Trash tab's buckets. `key` picks the list out of the scan; `col` keeps
 -- its collapse state separate from the disenchant tab's.
 local TRASH_BUCKETS = {
-  { key = "safe",    col = "tsafe",    title = "[OK] Junk — click deletes it", color = "|cff33cc44" },
-  { key = "confirm", col = "tconfirm", title = "[CHECK] Check first",         color = "|cffffd100" },
-  { key = "blocked", col = "tblocked", title = "[LOCKED] Protected",          color = "|cffff5555" },
+  { key = "safe",    col = "tsafe",    title = "JUNK · CLICK TO DELETE", color = "|cff55c96b" },
+  { key = "confirm", col = "tconfirm", title = "REVIEW FIRST",           color = "|cffd7ad45" },
+  { key = "blocked", col = "tblocked", title = "PROTECTED",              color = "|cffb96a6a" },
 }
 
 local function isCollapsed(key) return db().collapsed[key] == true end
@@ -955,6 +1069,31 @@ local function disarmAll()
   for _, row in ipairs(win.rows) do arm(row, "blocked") end
 end
 
+-- Row order is held while the window stays open, so a rebuild never slides a
+-- different item under the cursor: rows keep the position they were first
+-- shown at and anything new joins the bottom of its section. Each item key is
+-- ranked the first time it is seen; DE.Resort forgets the ranks, which puts
+-- the list back in scan order (cheapest first). Ranks outlive a row, so an
+-- item that drops out for a moment — locked mid-move — returns to its place.
+local listOrder = {}
+local function byHeldOrder(a, b)
+  if a.rank ~= b.rank then return a.rank < b.rank end
+  return a.scanIdx < b.scanIdx
+end
+local function holdOrder(tab, ...)
+  local o = listOrder[tab]
+  if not o then o = { n = 0, rank = {} }; listOrder[tab] = o end
+  for li = 1, select("#", ...) do
+    local list = select(li, ...)
+    for i, it in ipairs(list) do
+      local k = keyOf(it)
+      if not o.rank[k] then o.n = o.n + 1; o.rank[k] = o.n end
+      it.rank, it.scanIdx = o.rank[k], i
+    end
+    table.sort(list, byHeldOrder)
+  end
+end
+
 local function headerRow(i)
   local row = win.heads[i]
   if row then return row end
@@ -963,7 +1102,7 @@ local function headerRow(i)
   row:SetPoint("RIGHT", win.content, "RIGHT", 0, 0)
   row.bg = row:CreateTexture(nil, "BACKGROUND")
   row.bg:SetAllPoints()
-  row.bg:SetColorTexture(0.22, 0.16, 0.30, 0.55)
+  row.bg:SetColorTexture(0.12, 0.12, 0.14, 0.92)
   row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
   row.toggle = row:CreateTexture(nil, "ARTWORK")
   row.toggle:SetSize(14, 14)
@@ -972,7 +1111,7 @@ local function headerRow(i)
   row.text:SetPoint("LEFT", row.toggle, "RIGHT", 4, 0)
   row:SetScript("OnClick", function(self)
     local col = db().collapsed
-    col[self.key] = (not col[self.key]) or nil
+    col[self.key] = not col[self.key]
     DE.Refresh()
   end)
   win.heads[i] = row
@@ -995,6 +1134,11 @@ local function itemRow(i)
   row.bg = row:CreateTexture(nil, "BACKGROUND")
   row.bg:SetAllPoints()
 
+  row.state = row:CreateTexture(nil, "BORDER")
+  row.state:SetPoint("TOPLEFT", 0, -1)
+  row.state:SetPoint("BOTTOMLEFT", 0, 1)
+  row.state:SetWidth(3)
+
   -- The in-row cast bar: a translucent fill that sweeps across the row while
   -- your Disenchant is casting on its item. BACKGROUND layer, so the icon and
   -- text stay readable on top of it.
@@ -1007,24 +1151,24 @@ local function itemRow(i)
 
   row.icon = row:CreateTexture(nil, "ARTWORK")
   row.icon:SetSize(22, 22)
-  row.icon:SetPoint("LEFT", 2, 0)
+  row.icon:SetPoint("LEFT", 7, 0)
   row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93) -- shave the icon's baked border
 
   -- The padlock: closed means the item is on your keep list forever, open means
   -- click to put it there. Blocked-by-a-guard rows also get an Allow button.
   row.lock = CreateFrame("Button", nil, row)
   row.lock:SetSize(16, 16)
-  row.lock:SetPoint("RIGHT", -2, 0)
+  row.lock:SetPoint("RIGHT", -6, 0)
   row.lock:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
   row.lock:SetScript("OnClick", function(self)
     local it = self:GetParent().item
     if not it then return end
-    DE.ToggleKeep(it.itemID, it.link)
+    DE.ToggleKeep(it)
   end)
   row.lock:SetScript("OnEnter", function(self)
     local it = self:GetParent().item
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText(it and db().keep.items[it.itemID]
+    GameTooltip:SetText(it and keptAs(it)
       and "On your keep list — click to remove"
       or "Click to never disenchant this item", 1, 1, 1)
     GameTooltip:Show()
@@ -1038,11 +1182,11 @@ local function itemRow(i)
   row.allow:SetScript("OnClick", function(self)
     local it = self:GetParent().item
     if not it then return end
-    if allowed[it.itemID] then
-      allowed[it.itemID] = nil
+    if allowed[keyOf(it)] then
+      allowed[keyOf(it)] = nil
       pr(("%s is protected by its guards again."):format(it.link))
     else
-      allowed[it.itemID] = true
+      allowed[keyOf(it)] = true
       pr(("%s allowed for this session — Ctrl-click to %s it."):format(it.link,
         it.trash and "delete" or "disenchant"))
     end
@@ -1051,9 +1195,9 @@ local function itemRow(i)
   row.allow:SetScript("OnEnter", function(self)
     local it = self:GetParent().item
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText(it and allowed[it.itemID]
+    GameTooltip:SetText(it and allowed[keyOf(it)]
       and "Restore guard protection" or "Ignore the guard for this session", 1, 1, 1)
-    GameTooltip:AddLine(it and allowed[it.itemID]
+    GameTooltip:AddLine(it and allowed[keyOf(it)]
       and "Undo the session override and apply all guards again."
       or (("The row moves to Check first; a Ctrl-click will then %s it. Forgotten on logout.")
         :format(it and it.trash and "delete" or "disenchant")), 0.6, 0.6, 0.6, true)
@@ -1206,7 +1350,7 @@ function DE.Refresh()
   if not (win and win:IsShown()) then return end
   if win.tab == "options" then
     DE.RefreshOptions()
-    win.status:SetText("Options")
+    win.status:SetText("Settings")
     win.hint:SetText("Choose what is protected and what requires confirmation.")
     return
   end
@@ -1216,7 +1360,8 @@ function DE.Refresh()
     return -- SetAttribute is forbidden in combat; PLAYER_REGEN_ENABLED redraws
   end
   win.content:SetAlpha(1)
-  if win.tab == "run" then return DE.RefreshRun() end
+  if win.tab == "split" then return DE.RefreshSplit() end
+  if win.tab == "history" then return DE.RefreshHistory() end
   local trash = win.tab == "trash"
   local safe, confirm, blocked
   if trash then
@@ -1224,6 +1369,7 @@ function DE.Refresh()
   else
     safe, confirm, blocked = DE.Scan()
   end
+  holdOrder(trash and "trash" or "disenchant", safe, confirm, blocked)
   if filterText ~= "" then
     local needle = filterText:lower()
     local function filter(list)
@@ -1269,12 +1415,13 @@ function DE.Refresh()
         ri = ri + 1
         local row = itemRow(ri)
         row.item = it
+        row.bg:SetColorTexture(0.055, 0.06, 0.07, ri % 2 == 0 and 0.88 or 0.72)
         if it.tier == "safe" then
-          row.bg:SetColorTexture(0.20, 0.65, 0.28, ri % 2 == 0 and 0.10 or 0.06)
+          row.state:SetColorTexture(0.25, 0.72, 0.38, 0.95)
         elseif it.tier == "confirm" then
-          row.bg:SetColorTexture(1, 0.72, 0, ri % 2 == 0 and 0.14 or 0.09)
+          row.state:SetColorTexture(0.86, 0.62, 0.18, 0.95)
         else
-          row.bg:SetColorTexture(0.85, 0.22, 0.22, ri % 2 == 0 and 0.11 or 0.07)
+          row.state:SetColorTexture(0.62, 0.32, 0.32, 0.80)
         end
         row.icon:SetTexture(it.icon or FALLBACK_ICON)
         row.icon:SetDesaturated(it.tier == "blocked")
@@ -1308,11 +1455,11 @@ function DE.Refresh()
         end
         row.castFill:SetShown(it.casting and true or false)
         if it.casting then win.castingRow = row end
-        row.lock:Show() -- the Run tab hides it
-        row.lock:SetNormalTexture(db().keep.items[it.itemID] and LOCKED or UNLOCKED)
-        row.allow:SetText(allowed[it.itemID] and "Restore" or "Allow")
-        row.allow:SetWidth(allowed[it.itemID] and 54 or 46)
-        row.allow:SetShown((it.tier == "blocked" and not it.permanent) or allowed[it.itemID])
+        row.lock:Show() -- the Run Split and History tabs hide it
+        row.lock:SetNormalTexture(keptAs(it) and LOCKED or UNLOCKED)
+        row.allow:SetText(allowed[keyOf(it)] and "Restore" or "Allow")
+        row.allow:SetWidth(allowed[keyOf(it)] and 54 or 46)
+        row.allow:SetShown((it.tier == "blocked" and not it.permanent) or allowed[keyOf(it)])
         if trash then
           armTrash(row, it.tier, it.bag, it.slot)
         else
@@ -1344,8 +1491,16 @@ function DE.Refresh()
   if trash or filterText ~= "" then DE.UpdateBroker() else DE.UpdateBroker(#safe, #confirm) end
 end
 
+--- Rebuild in scan order, dropping the held row order. For moments the user
+--- asked for a fresh list — opening the window, switching tab, Rescan, a sort
+--- change — never for a bag event.
+function DE.Resort()
+  listOrder = {}
+  DE.Refresh()
+end
+
 --------------------------------------------------------------------------------
--- The Run tab: the audit, on screen instead of in chat. Everything shown is
+-- The Run Split tab: the live audit-backed material inventory. Everything shown is
 -- since the run marker (or login), so the shards you walked in with never
 -- appear — the numbers come from the audit log, not from your bags.
 --------------------------------------------------------------------------------
@@ -1357,7 +1512,7 @@ local function iconOf(link)
   return ok and icon or nil
 end
 
-function DE.RefreshRun()
+function DE.RefreshSplit()
   local d = db()
   local since = d.splitStart or sessionStart
   local sinceLabel = date("%H:%M", since) .. (d.splitStart and "" or " (login)")
@@ -1387,7 +1542,8 @@ function DE.RefreshRun()
     ri = ri + 1
     local row = itemRow(ri)
     row.item = { run = true, runLink = link }
-    row.bg:SetColorTexture(1, 1, 1, ri % 2 == 0 and 0.055 or 0.025)
+    row.bg:SetColorTexture(0.055, 0.06, 0.07, ri % 2 == 0 and 0.88 or 0.72)
+    row.state:SetColorTexture(0.32, 0.48, 0.68, 0.85)
     row.icon:SetTexture(iconOf(link) or FALLBACK_ICON)
     row.icon:SetDesaturated(false)
     row.name:SetText(nameText)
@@ -1447,20 +1603,6 @@ function DE.RefreshRun()
     end
   end
 
-  head("runhistory", ("|cffb37ce8History|r  |cff888888(%d archived)|r"):format(#d.runs))
-  if not isCollapsed("runhistory") then
-    for i = #d.runs, math.max(1, #d.runs - 9), -1 do
-      local r = d.runs[i]
-      local produced = 0
-      for _, material in ipairs(r.totals) do produced = produced + (material.n or 0) end
-      line(nil, ("|cffffd100%s|r  |cff888888%s|r"):format(r.name or "Run",
-        date("%d %b %H:%M", r.start)),
-        ("|cff777777%d drop%s · %d material%s · %d member%s|r"):format(
-          r.drops or 0, r.drops == 1 and "" or "s", produced, produced == 1 and "" or "s",
-          #(r.members or {}), #(r.members or {}) == 1 and "" or "s"))
-    end
-  end
-
   for i = hi + 1, #win.heads do win.heads[i]:Hide() end
   for i = ri + 1, #win.rows do
     arm(win.rows[i], "blocked")
@@ -1475,12 +1617,82 @@ function DE.RefreshRun()
   DE.UpdateBroker()
 end
 
+-- Archived runs are deliberately separate from the live split inventory. Each
+-- run expands to its material totals and the roster captured when it ended.
+function DE.RefreshHistory()
+  local d = db()
+  win.hint:SetText("Archived runs — expand one to inspect its materials and roster.")
+  -- The hint line is hidden, so the empty state has to say how runs get here.
+  win.empty:SetText("No archived runs yet\nPress New run on the Run Split tab (or /de runs end)\nto save what you've disenchanted so far as a run.")
+  win.castingRow = nil
+
+  local hi, ri, y = 0, 0, 0
+  local function head(key, text)
+    hi = hi + 1
+    local h = headerRow(hi)
+    h.key = key
+    h.toggle:SetTexture(isCollapsed(key) and PLUS or MINUS)
+    h.text:SetText(text)
+    h:ClearAllPoints()
+    h:SetPoint("TOPLEFT", 0, y)
+    h:SetPoint("TOPRIGHT", 0, y)
+    h:Show()
+    y = y - HEAD_H
+  end
+  local function line(link, nameText, noteText)
+    ri = ri + 1
+    local row = itemRow(ri)
+    row.item = { run = true, runLink = link }
+    row.bg:SetColorTexture(0.055, 0.06, 0.07, ri % 2 == 0 and 0.88 or 0.72)
+    row.state:SetColorTexture(0.50, 0.36, 0.65, 0.85)
+    row.icon:SetTexture(iconOf(link) or FALLBACK_ICON)
+    row.icon:SetDesaturated(false)
+    row.name:SetText(nameText)
+    row.note:SetText(noteText or "")
+    row.castFill:Hide()
+    row.lock:Hide()
+    row.allow:Hide()
+    arm(row, "blocked")
+    row:ClearAllPoints()
+    row:SetPoint("TOPLEFT", 0, y)
+    row:SetPoint("TOPRIGHT", 0, y)
+    row:Show()
+    y = y - ROW_H
+  end
+
+  for i = #d.runs, 1, -1 do
+    local run = d.runs[i]
+    local key = "history" .. tostring(run.start or i)
+    head(key, ("|cffb37ce8%s|r  |cff888888%s — %d drop%s|r"):format(
+      run.name or "Run", date("%d %b %Y %H:%M", run.start), run.drops or 0,
+      run.drops == 1 and "" or "s"))
+    if not isCollapsed(key) then
+      local names = table.concat(run.members or {}, ", ")
+      for _, material in ipairs(run.totals or {}) do
+        line(material.out, ("%s |cffffffffx%d|r"):format(material.out, material.n or 0),
+          "|cff777777" .. (names ~= "" and names or "No roster captured") .. "|r")
+      end
+    end
+  end
+
+  for i = hi + 1, #win.heads do win.heads[i]:Hide() end
+  for i = ri + 1, #win.rows do
+    arm(win.rows[i], "blocked")
+    win.rows[i].item = nil
+    win.rows[i]:Hide()
+  end
+  win.content:SetHeight(math.max(-y, 1))
+  win.empty:SetShown(#d.runs == 0)
+  win.status:SetText(("|cffb37ce8%d archived run%s|r"):format(#d.runs, #d.runs == 1 and "" or "s"))
+  DE.UpdateBroker()
+end
+
 --------------------------------------------------------------------------------
 -- Options tab: the guard toggles and the three thresholds.
 --------------------------------------------------------------------------------
 local function ensureOptions(parent)
   local o = CreateFrame("Frame", nil, parent, BackdropTemplateMixin and "BackdropTemplate" or nil)
-  o:SetPoint("TOPLEFT", parent, "TOPLEFT", 5, -74)
+  o:SetPoint("TOPLEFT", parent, "TOPLEFT", 5, -64)
   o:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -5, 34)
   backdrop(o, 0.96)
   o:EnableMouse(true)
@@ -1556,7 +1768,7 @@ local function ensureOptions(parent)
   o.profit:SetHeight(22)
   o.profit:SetScript("OnClick", function()
     db().sortProfit = not db().sortProfit
-    DE.Refresh()
+    DE.Resort()
   end)
   o.profit:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -1570,8 +1782,8 @@ local function ensureOptions(parent)
   hint:SetPoint("BOTTOMLEFT", 12, 10)
   hint:SetPoint("BOTTOMRIGHT", -12, 10)
   hint:SetJustifyH("LEFT")
-  hint:SetText("Keep list: |cffffd100/de keep #itemid|r or |cffffd100/de keep name:text|r, "
-    .. "or the padlock on any row.")
+  hint:SetText("Padlock a row to keep that exact item. |cffffd100/de keep #itemid|r keeps "
+    .. "every version, |cffffd100/de keep name:text|r matches names.")
   return o
 end
 
@@ -1605,8 +1817,8 @@ local function ensureWindow()
     tile = true, tileSize = 16, edgeSize = 8,
     insets = { left = 2, right = 2, top = 2, bottom = 2 },
   })
-  f:SetBackdropColor(0.08, 0.08, 0.08, 0.94)
-  f:SetBackdropBorderColor(0.28, 0.24, 0.34, 1)
+  f:SetBackdropColor(0.035, 0.04, 0.05, 0.97)
+  f:SetBackdropBorderColor(0.20, 0.22, 0.25, 1)
   f:SetMovable(true)
   f:SetResizable(true)
   if f.SetResizeBounds then f:SetResizeBounds(MIN_W, MIN_H, MAX_W, MAX_H)
@@ -1622,20 +1834,20 @@ local function ensureWindow()
     db().panel.x, db().panel.y = x, y
   end)
   f:SetFrameStrata("DIALOG")
-  f:SetScript("OnShow", function() DE.Refresh() end)
+  f:SetScript("OnShow", function() DE.Resort() end)
   tinsert(UISpecialFrames, "DisenchanterFrame") -- Esc closes it
 
   local header = f:CreateTexture(nil, "BORDER")
   header:SetPoint("TOPLEFT", 1, -1)
   header:SetPoint("TOPRIGHT", -1, -1)
-  header:SetHeight(18)
-  header:SetColorTexture(0.22, 0.16, 0.30, 0.98)
-  local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  title:SetPoint("TOPLEFT", 6, -4)
+  header:SetHeight(20)
+  header:SetColorTexture(0.10, 0.085, 0.13, 0.98)
+  local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  title:SetPoint("TOPLEFT", 8, -5)
   title:SetText("Disenchanter")
   local close = CreateFrame("Button", nil, f)
-  close:SetSize(14, 14)
-  close:SetPoint("TOPRIGHT", -3, -3)
+  close:SetSize(18, 18)
+  close:SetPoint("TOPRIGHT", -2, -2)
   local closeText = close:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   closeText:SetAllPoints(); closeText:SetText("x")
   close:SetScript("OnClick", function() f:Hide() end)
@@ -1644,15 +1856,16 @@ local function ensureWindow()
   win.rows, win.heads = {}, {}
 
   win.status = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  win.status:SetPoint("TOPLEFT", 7, -23)
-  win.status:SetPoint("TOPRIGHT", -7, -23)
+  win.status:SetPoint("TOPLEFT", 8, -25)
+  win.status:SetPoint("TOPRIGHT", -8, -25)
   win.status:SetJustifyH("LEFT")
 
   win.hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  win.hint:SetPoint("TOPLEFT", 7, -39)
-  win.hint:SetPoint("TOPRIGHT", -7, -39)
+  win.hint:SetPoint("TOPLEFT", 8, -39)
+  win.hint:SetPoint("TOPRIGHT", -8, -39)
   win.hint:SetJustifyH("LEFT")
   win.hint:SetWordWrap(false) -- a long hint truncates rather than spill into the tabs
+  win.hint:Hide() -- row state and tooltips explain actions without another chrome line
   win.hint:SetText("Click a green row to disenchant it \226\128\148 Ctrl-click an amber one.")
 
   -- Draw tabs locally instead of inheriting a FrameXML tab template: the
@@ -1660,16 +1873,16 @@ local function ensureWindow()
   local function tabButton(id, label, w, tab)
     local b = CreateFrame("Button", "DisenchanterFrameTab" .. id, f)
     b:SetID(id)
-    b:SetSize(w, 24)
+    b:SetSize(w, 20)
     b.bg = b:CreateTexture(nil, "BACKGROUND")
     b.bg:SetPoint("TOPLEFT", 1, -1)
     b.bg:SetPoint("BOTTOMRIGHT", -1, 0)
-    b.bg:SetColorTexture(0.10, 0.08, 0.12, 0.96)
+    b.bg:SetColorTexture(0.055, 0.06, 0.07, 0.96)
     b.edge = b:CreateTexture(nil, "BORDER")
     b.edge:SetPoint("BOTTOMLEFT", 1, 0)
     b.edge:SetPoint("BOTTOMRIGHT", -1, 0)
     b.edge:SetHeight(2)
-    b.edge:SetColorTexture(0.50, 0.42, 0.58, 0.9)
+    b.edge:SetColorTexture(0.24, 0.26, 0.30, 0.9)
     b.text = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     b.text:SetPoint("CENTER", 0, 1)
     b.text:SetText(label)
@@ -1678,30 +1891,32 @@ local function ensureWindow()
     return b
   end
   win.tab = "de"
-  win.tabDE = tabButton(1, "Disenchant", 100, "de")
-  win.tabDE:SetPoint("TOPLEFT", 5, -53)
-  win.tabTrash = tabButton(2, "Trash", 70, "trash")
-  win.tabTrash:SetPoint("LEFT", win.tabDE, "RIGHT", -8, 0)
-  win.tabRun = tabButton(3, "Run", 60, "run")
-  win.tabRun:SetPoint("LEFT", win.tabTrash, "RIGHT", -8, 0)
-  win.tabOptions = tabButton(4, "Options", 78, "options")
-  win.tabOptions:SetPoint("LEFT", win.tabRun, "RIGHT", -8, 0)
+  win.tabDE = tabButton(1, "Disenchant", 82, "de")
+  win.tabDE:SetPoint("TOPLEFT", 5, -43)
+  win.tabTrash = tabButton(2, "Cleanup", 58, "trash")
+  win.tabTrash:SetPoint("LEFT", win.tabDE, "RIGHT", 2, 0)
+  win.tabSplit = tabButton(3, "Run Split", 66, "split")
+  win.tabSplit:SetPoint("LEFT", win.tabTrash, "RIGHT", 2, 0)
+  win.tabHistory = tabButton(4, "History", 58, "history")
+  win.tabHistory:SetPoint("LEFT", win.tabSplit, "RIGHT", 2, 0)
+  win.tabOptions = tabButton(5, "Settings", 60, "options")
+  win.tabOptions:SetPoint("LEFT", win.tabHistory, "RIGHT", 2, 0)
   function win:SelectTabChrome(tabID)
-    for id, button in ipairs({ self.tabDE, self.tabTrash, self.tabRun, self.tabOptions }) do
+    for id, button in ipairs({ self.tabDE, self.tabTrash, self.tabSplit, self.tabHistory, self.tabOptions }) do
       local selected = id == tabID
       button:SetEnabled(not selected)
-      button.bg:SetColorTexture(selected and 0.22 or 0.10,
-        selected and 0.16 or 0.08, selected and 0.30 or 0.12, 0.96)
-      button.edge:SetColorTexture(selected and 1 or 0.50,
-        selected and 0.82 or 0.42, selected and 0 or 0.58, selected and 1 or 0.9)
-      button.text:SetTextColor(selected and 1 or 0.80,
-        selected and 0.82 or 0.80, selected and 0 or 0.80)
+      button.bg:SetColorTexture(selected and 0.11 or 0.055,
+        selected and 0.115 or 0.06, selected and 0.14 or 0.07, 0.96)
+      button.edge:SetColorTexture(selected and 0.88 or 0.24,
+        selected and 0.68 or 0.26, selected and 0.24 or 0.30, selected and 1 or 0.9)
+      button.text:SetTextColor(selected and 1 or 0.68,
+        selected and 0.84 or 0.70, selected and 0.46 or 0.74)
     end
   end
   win:SelectTabChrome(1)
 
   local inset = CreateFrame("Frame", nil, f, BackdropTemplateMixin and "BackdropTemplate" or nil)
-  inset:SetPoint("TOPLEFT", 5, -74)
+  inset:SetPoint("TOPLEFT", 5, -64)
   inset:SetPoint("BOTTOMRIGHT", -5, 34)
   backdrop(inset, 0.55)
   local scroll = CreateFrame("ScrollFrame", "DisenchanterScroll", inset, "UIPanelScrollFrameTemplate")
@@ -1727,7 +1942,14 @@ local function ensureWindow()
   end
   local rescan = mk("Rescan", 80)
   rescan:SetPoint("BOTTOMLEFT", 6, 6)
-  rescan:SetScript("OnClick", function() questCache = {}; DE.Refresh() end)
+  rescan:SetScript("OnClick", function() questCache = {}; DE.Resort() end)
+  rescan:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Rescan and re-sort", 1, 1, 1)
+    GameTooltip:AddLine("While the window is open rows hold their place and new items join the bottom of their section. This puts the list back in order.", 0.6, 0.6, 0.6, true)
+    GameTooltip:Show()
+  end)
+  rescan:SetScript("OnLeave", tipHide)
 
   local report = mk("To chat", 80)
   report:SetPoint("BOTTOMRIGHT", -20, 6)
@@ -1758,21 +1980,19 @@ local function ensureWindow()
   search:SetScript("OnLeave", tipHide)
   win.search = search
 
-  -- The Run tab's bottom row, swapped in for Rescan/To chat by SetTab.
+  -- The Run Split tab's bottom row, swapped in for Rescan/To chat by SetTab.
   local newRun = mk("New run", 80)
   newRun:SetPoint("BOTTOMLEFT", 6, 6)
   newRun:SetScript("OnClick", function()
-    local archived = archiveCurrentRun()
-    db().splitStart = time()
-    db().runName = nil
+    local archived = startRun()
     pr((archived and "previous run archived; new" or "run")
-      .. " marker set — the Run tab and /de split now count from this moment.")
+      .. " marker set — the Run Split tab now counts from this moment.")
     DE.Refresh()
   end)
   newRun:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:SetText("Start a new run", 1, 1, 1)
-    GameTooltip:AddLine("Moves the marker to now. Earlier disenchants stay in /de audit but stop counting toward this run's split.", 0.6, 0.6, 0.6, true)
+    GameTooltip:AddLine("Saves the run so far to the History tab, then moves the marker to now. Earlier disenchants stay in /de audit but stop counting toward this run's split.", 0.6, 0.6, 0.6, true)
     GameTooltip:Show()
   end)
   newRun:SetScript("OnLeave", tipHide)
@@ -1844,18 +2064,22 @@ end
 
 function DE.SetTab(tab)
   local f = ensureWindow()
+  if tab == "run" then tab = "split" end -- compatibility with older callers
   f.tab = tab
-  local tabID = tab == "trash" and 2 or tab == "run" and 3 or tab == "options" and 4 or 1
+  local tabID = tab == "trash" and 2 or tab == "split" and 3
+    or tab == "history" and 4 or tab == "options" and 5 or 1
   f:SelectTabChrome(tabID)
-  local run = tab == "run"
+  local split = tab == "split"
+  local history = tab == "history"
   local options = tab == "options"
-  f.rescan:SetShown(not run and not options)
-  f.report:SetShown(not run and not options)
-  f.search:SetShown(not run and not options)
-  f.newRun:SetShown(run)
-  f.announce:SetShown(run)
+  local inventory = split or history
+  f.rescan:SetShown(not inventory and not options)
+  f.report:SetShown(not inventory and not options)
+  f.search:SetShown(not inventory and not options)
+  f.newRun:SetShown(split)
+  f.announce:SetShown(split)
   f.opts:SetShown(options)
-  DE.Refresh()
+  DE.Resort()
 end
 
 --------------------------------------------------------------------------------
@@ -1933,26 +2157,40 @@ end
 --------------------------------------------------------------------------------
 -- Keep list.
 --------------------------------------------------------------------------------
-function DE.ToggleKeep(itemID, link)
+--- The padlock. `it` is a scanned item record. Locking writes this exact
+--- variant; unlocking removes whatever was protecting the row, including a
+--- bare-id entry that covered every version.
+function DE.ToggleKeep(it)
   local keep = db().keep
-  if keep.items[itemID] then
-    keep.items[itemID] = nil
-    pr((link or ("#" .. itemID)) .. " taken off your keep list.")
+  local label = it.link or ("#" .. tostring(it.itemID))
+  local kept, everyVersion = keptAs(it)
+  if kept then
+    keep.items[kept] = nil
+    pr(label .. " taken off your keep list."
+      .. (everyVersion and " That entry covered every version of this item — padlock any you still want kept." or ""))
   else
-    keep.items[itemID] = true
-    allowed[itemID] = nil
-    pr((link or ("#" .. itemID)) .. " will never be disenchanted.")
+    -- The link is stored as the value so /de keeps can name the variant.
+    keep.items[keyOf(it)] = it.link or true
+    allowed[keyOf(it)] = nil
+    pr(label .. " will never be disenchanted.")
   end
   DE.Refresh()
 end
 
 function DE.AddKeep(spec)
-  if not spec or spec == "" then pr("usage: /de keep <#itemid|name:text>") return end
+  if not spec or spec == "" then pr("usage: /de keep <#itemid|[item link]|name:text>") return end
   local keep = db().keep
   local id = spec:match("^#?(%d+)$")
+  local link = spec:match("|c[^|]*|Hitem:.-|h.-|h|r") or spec:match("|Hitem:.-|h.-|h")
   if id then
     keep.items[tonumber(id)] = true
-    pr((GetItemInfo(tonumber(id)) or ("#" .. id)) .. " added to the keep list.")
+    pr((GetItemInfo(tonumber(id)) or ("#" .. id)) .. " added to the keep list — every version of it.")
+  elseif link then
+    -- A shift-clicked link names one exact variant.
+    local linkID = tonumber(link:match("item:(%d+)"))
+    if not linkID then pr("couldn't read an item id from that link.") return end
+    keep.items[itemKey(link, linkID)] = link
+    pr(link .. " added to the keep list.")
   else
     local text = spec:match("^name:(.+)$") or spec
     keep.names[#keep.names + 1] = text
@@ -1961,12 +2199,19 @@ function DE.AddKeep(spec)
   DE.Refresh()
 end
 
--- Item-id entries sorted ascending, then the name patterns in entry order —
--- Keeps and DeleteKeep must agree on this numbering, so both build it here.
+-- Item entries sorted by item id (bare ids before their variants), then the
+-- name patterns in entry order — Keeps and DeleteKeep must agree on this
+-- numbering, so both build it here.
 local function keepIDs()
   local ids = {}
   for id in pairs(db().keep.items) do ids[#ids + 1] = id end
-  table.sort(ids)
+  local function base(key) return tonumber(tostring(key):match("^%d+")) or 0 end
+  table.sort(ids, function(a, b)
+    local ba, bb = base(a), base(b)
+    if ba ~= bb then return ba < bb end
+    if type(a) ~= type(b) then return type(a) == "number" end
+    return tostring(a) < tostring(b)
+  end)
   return ids
 end
 
@@ -1978,7 +2223,12 @@ function DE.Keeps()
   local i = 0
   for _, id in ipairs(ids) do
     i = i + 1
-    print(("    %d. %s"):format(i, (select(2, GetItemInfo(id))) or ("#" .. id)))
+    local saved = keep.items[id]
+    if type(id) == "number" then
+      print(("    %d. %s  |cff888888every version|r"):format(i, (select(2, GetItemInfo(id))) or ("#" .. id)))
+    else
+      print(("    %d. %s"):format(i, type(saved) == "string" and saved or ("#" .. id)))
+    end
   end
   for _, name in ipairs(keep.names) do
     i = i + 1
@@ -2081,8 +2331,10 @@ end
 --------------------------------------------------------------------------------
 local ev = CreateFrame("Frame")
 ev:RegisterEvent("PLAYER_LOGIN")
+ev:RegisterEvent("PLAYER_LOGOUT") -- nothing to do but stamp lastSeen one last time
 ev:RegisterEvent("BAG_UPDATE")
 ev:RegisterEvent("BAG_UPDATE_DELAYED")
+ev:RegisterEvent("ITEM_LOCK_CHANGED")
 ev:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 ev:RegisterEvent("PLAYER_REGEN_ENABLED")
 ev:RegisterEvent("PLAYER_REGEN_DISABLED")
@@ -2094,9 +2346,11 @@ ev:RegisterEvent("UNIT_SPELLCAST_STOP")
 ev:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
 ev:RegisterEvent("UNIT_SPELLCAST_FAILED")
 ev:RegisterEvent("CHAT_MSG_LOOT")
-ev:RegisterEvent("GROUP_ROSTER_UPDATE") -- the Run tab's "split N ways" and Announce state
+ev:RegisterEvent("GROUP_ROSTER_UPDATE") -- the Run Split tab's shares and Announce state
 
 -- Coalesce the burst of BAG_UPDATEs a disenchant produces into one rebuild.
+-- Rows are already disarmed by the time this is queued, so the short wait is
+-- only ever a moment of dead clicks, never a stale target.
 local pending
 local function queueRefresh()
   if pending then return end
@@ -2109,8 +2363,11 @@ local function queueRefresh()
 end
 
 ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
+  -- The session heartbeat: see resumeSession.
+  if sessionLive then db().lastSeen = time() end
+
   if event == "PLAYER_LOGIN" then
-    db()
+    resumeSession()
     ensureWindow()
     DE.InitBroker()
     if not knowsDisenchant() then
@@ -2123,6 +2380,12 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     finishPendingTrash()
     -- Disarm immediately: between an item moving and the rebuild landing, a
     -- stale row would point at whatever is now in that slot.
+    disarmAll()
+    queueRefresh()
+
+  elseif event == "ITEM_LOCK_CHANGED" then
+    -- A drag/split locks the slot before BAG_UPDATE announces its new contents.
+    -- Disarm at the beginning of the move, not only after it completes.
     disarmAll()
     queueRefresh()
 
@@ -2209,8 +2472,10 @@ function DE.Command(rest)
     DE.Toggle()
   elseif cmd == "trash" or cmd == "junk" then
     DE.ShowTab("trash")
-  elseif cmd == "run" then
-    DE.ShowTab("run")
+  elseif cmd == "run" or cmd == "splitview" then
+    DE.ShowTab("split")
+  elseif cmd == "history" and args == "" then
+    DE.ShowTab("history")
   elseif cmd == "scan" or cmd == "list" then
     DE.Report()
   elseif cmd == "keep" then
@@ -2271,7 +2536,7 @@ function DE.Command(rest)
   elseif cmd == "profit" then
     db().sortProfit = not db().sortProfit
     pr("estimated-profit sorting " .. (db().sortProfit and "|cff33cc44on|r." or "|cffff5555off|r."))
-    DE.Refresh()
+    DE.Resort()
   elseif cmd == "debug" then
     DE.Debug()
   elseif cmd == "mode" then
@@ -2280,7 +2545,7 @@ function DE.Command(rest)
     pr("click mode: |cffffd100" .. d.clickMode .. "|r")
     DE.Refresh()
   else
-    pr("commands: (no args) | trash | run | scan | keep <#id|name:text> | keep del <n> | keeps | value <gold> | ilvl <n> | confirm <green|blue|epic> | guard [name] | learned [clear] | tally | audit [n|clear] | split [start|say|party|raid] | runs [name <text>|end|clear] | profit | mode | debug")
+    pr("commands: (no args) | trash | run | history | scan | keep <#id|[link]|name:text> | keep del <n> | keeps | value <gold> | ilvl <n> | confirm <green|blue|epic> | guard [name] | learned [clear] | tally | audit [n|clear] | split [start|say|party|raid] | runs [name <text>|end|clear] | profit | mode | debug")
   end
 end
 
@@ -2289,6 +2554,8 @@ SLASH_DISENCHANTER2 = "/disenchanter"
 SlashCmdList.DISENCHANTER = function(msg) DE.Command(msg) end
 
 DE._verdict = verdict
+DE._itemKey = itemKey
+DE._resumeSession = resumeSession
 DE._trashVerdict = trashVerdict
 DE._expectedDisenchantValue = expectedDisenchantValue
 DE._db = db

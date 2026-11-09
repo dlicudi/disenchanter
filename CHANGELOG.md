@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Rows now hold their position while the window is open: a bag update no longer
+  re-sorts the list under the cursor, and newly looted items join the bottom of
+  their section. Opening the window, switching tab, changing the sort, or
+  pressing Rescan puts the list back in sorted order.
+- Bag moves now disarm rows at the initial item-lock event, not only at the
+  bag update that follows.
+- Reworked the panel hierarchy with compact navigation, neutral surfaces,
+  denser rows, restrained state accents, and Protected sections collapsed by
+  default instead of presenting a wall of low-priority items.
+- Replaced the combined Run tab with a live Run Split inventory and a separate,
+  expandable History tab for archived material totals and captured rosters.
 - Split static disenchant data and saved-variable repair into load-ordered
   modules, keeping persistence and data maintenance out of runtime UI code.
 - Unified yield hints, skill requirements, and profit-estimate material IDs in
@@ -10,6 +21,25 @@
   bag scans and sort comparisons.
 - Removed the duplicated user manual from the main Lua file and expanded data
   consistency coverage for both Era and TBC rules.
+- Fixed: two versions of one item ("Notched Shortsword of Magic" / "of
+  Healing") were treated as the same item. The keep list and the session
+  **Allow** override are now keyed by the item's variant — its random suffix on
+  older clients, its bonus ids on 1.60 — and rows show the suffixed name. A
+  padlock keeps that exact version; `/de keep #itemid` (and any entry saved by
+  an earlier version) still covers every version, and says so on the row.
+  `/de keep` also accepts a shift-clicked item link.
+- Fixed: nothing was ever written to the audit, the Run Split log, or run
+  history on the 1.60 client. Its item links start `|cnIQ2:` rather than a hex
+  colour, which the loot matcher rejected.
+- Fixed: a material looted either side of a level-up was totalled as two
+  separate rows in the split, because links embed the character level.
+- **New run** and `/de runs end` now archive what the Run Split tab is showing
+  even when no marker was set, instead of discarding disenchants made since
+  login. Ending a run leaves a fresh marker, so its drops can't reappear in the
+  live split or be archived twice.
+- A run with no marker now survives `/reload` and disconnects: the session
+  start is saved, and logging back in within 30 minutes resumes it instead of
+  restarting the count. `/de tally` is rebuilt from the audit the same way.
 
 ## 0.6.0 — 2026-10-31
 

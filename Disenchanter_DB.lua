@@ -15,6 +15,10 @@ local function repair(d, guards, schemaVersion)
   if type(d.audit) ~= "table" then d.audit = {} end
   if type(d.runs) ~= "table" then d.runs = {} end
   if type(d.collapsed) ~= "table" then d.collapsed = {} end
+  -- Keep the long, low-priority sections out of the way on first use. Explicit
+  -- false values are retained when a player chooses to leave them expanded.
+  if d.collapsed.blocked == nil then d.collapsed.blocked = true end
+  if d.collapsed.tblocked == nil then d.collapsed.tblocked = true end
   if type(d.panel) ~= "table" then d.panel = {} end
 
   d.confirmAbove = tonumber(d.confirmAbove) or 2
@@ -22,6 +26,8 @@ local function repair(d, guards, schemaVersion)
   d.valueGold = math.max(0, tonumber(d.valueGold) or 10)
   d.ilvlCap = math.max(0, tonumber(d.ilvlCap) or 0)
   if type(d.sortProfit) ~= "boolean" then d.sortProfit = false end
+  if type(d.sessionStart) ~= "number" then d.sessionStart = nil end
+  if type(d.lastSeen) ~= "number" then d.lastSeen = nil end
 
   -- Reset the old diagnostic spell path once. Macro mode is the supported
   -- default; the alternate remains available through /de mode.
@@ -34,8 +40,13 @@ local function repair(d, guards, schemaVersion)
     end
   end
 
+  -- Keys are a bare item id (every version of the item) or an
+  -- "id:suffix:bonus" variant string; a variant's value may be its link, kept
+  -- so the list can name it.
   for id, kept in pairs(d.keep.items) do
-    if type(id) ~= "number" or kept ~= true then d.keep.items[id] = nil end
+    local validKey = type(id) == "number" or (type(id) == "string" and id:match("^%d+:%-?%d+:[%d%.]*$"))
+    local validValue = kept == true or (type(kept) == "string" and type(id) == "string")
+    if not (validKey and validValue) then d.keep.items[id] = nil end
   end
   for i = #d.keep.names, 1, -1 do
     if type(d.keep.names[i]) ~= "string" then table.remove(d.keep.names, i) end

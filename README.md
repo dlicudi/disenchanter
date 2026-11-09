@@ -16,6 +16,8 @@ three buckets:
 
 Rows are sorted cheapest-first inside each bucket, so working through a bag of
 greens is: click the top row, wait for the cast, click the new top row.
+The order is fixed when the window opens — anything you loot afterwards joins
+the bottom of its bucket until you press **Rescan** or reopen the window.
 While a disenchant is casting, click its row again to cancel it. The active row
 temporarily becomes a secure `/stopcasting` button and cannot target an item.
 
@@ -35,10 +37,10 @@ The estimate uses approximate Classic drop odds and is guidance, not a promise.
 Each row shows what it's likely to turn into (`Arcane Dust / Greater Planar
 Essence / Small Prismatic Shard`) or, if it's held back, why.
 
-## The Trash tab
+## The Cleanup tab
 
 The same idea pointed at deletion, for when the bags are full and there's no
-vendor in sight. `/de trash` (or the **Trash** tab in the window) lists the
+vendor in sight. `/de trash` (or the **Cleanup** tab in the window) lists the
 grey and white items in your bags, sorted **lowest vendor value first** — the
 top row is always the cheapest thing to lose. Each row shows what deleting it
 forfeits.
@@ -56,11 +58,11 @@ and rows disarm the moment bags change, same as disenchanting — a click can
 only ever destroy the exact item its row was showing. Deletions are recorded
 in `/de audit` as `item → deleted`; shard splits ignore them.
 
-## The Run tab
+## Run Split and History tabs
 
 For dungeon and raid nights where you're the designated disenchanter — the
-audit on screen instead of scrolling away in chat. `/de run` (or the **Run**
-tab) shows:
+audit on screen instead of scrolling away in chat. `/de run` opens the
+**Run Split** tab, which shows:
 
 - **Materials this run** — every material produced since the run marker, with
   the split for the current group on each row: `[Large Prismatic Shard] x13 —
@@ -72,12 +74,23 @@ The numbers come from the audit log, never from your bags — so the shards you
 walked in with, bank stock, and mail arrivals are all invisible to it. Only
 loot attributed to **your** Disenchant casts is counted.
 
-Press **New run** as the run begins: it moves the marker to now (same marker
-as `/de split start`). Earlier disenchants stay in `/de audit` but stop
+Without a marker the run counts from when you logged in. A `/reload` or a
+dropped connection does not restart that: logging back in within 30 minutes
+(the instance's own reset timer) resumes the same session, with its totals,
+log, and `/de tally` intact. Only a client crash loses anything — the game
+writes addon data on a clean shutdown, so disenchants since the last save go
+with it.
+
+Press **New run** as the run begins: it saves the run so far to History and
+moves the marker to now (same as `/de split start`). Earlier disenchants stay in `/de audit` but stop
 counting toward this run. **Announce** posts the totals and shares to
 party/raid chat — the only time the addon ever speaks, and only on that click.
 The split uses the roster at the moment you announce; who was present for
 which boss is the loot master's call, not arithmetic.
+
+The separate **History** tab contains archived runs. Expand a run to inspect
+its material totals and the roster captured when it ended. This keeps the live
+split inventory focused on the current run instead of mixing it with history.
 
 ## Safety
 
@@ -111,11 +124,18 @@ one edge and the button does nothing at all, with no error. Only left-click is
 ever bound, though: the attributes are written as `type1` / `typeLeftButton`
 with no bare `type`, so a right-click finds nothing.
 
-Two things stop a click going to the wrong item:
+Three things stop a click going to the wrong item:
 
 - **Bags change → every row disarms immediately.** `BAG_UPDATE` clears the macro
-  off every row; the rebuild ~0.1s later re-arms them against the correct slots.
-  A row can never fire at something that slid into its slot in between.
+  off every row, and `ITEM_LOCK_CHANGED` does the same at the start of a drag
+  or split, before its bag update arrives. The rebuild lands a tenth of a
+  second later and re-arms rows against the correct slots. A row can never
+  fire at something that slid into its slot in between.
+- **Rows hold their place.** While the window is open the list is not re-sorted:
+  a row stays where it was first shown and new items join the bottom of their
+  section, so a rebuild never puts a different item under the cursor. Reopening
+  the window, switching tab, changing the sort, or pressing Rescan sorts it
+  again.
 - **Ctrl for anything questionable.** "Check first" rows have no plain-click
   binding at all — only `ctrl-type1` is set — so a stray click is a no-op rather
   than a lost epic.
@@ -147,14 +167,21 @@ tomorrow. The button becomes **Restore**, so the override can be undone without
 logging out. To protect something permanently, press its **padlock** — that's
 the keep list, and it survives logout.
 
+The padlock keeps that exact item: lock "Notched Shortsword of Magic" and
+"Notched Shortsword of Healing" is still offered. `/de keep #itemid` is the
+broad form and covers every version of the item; such rows read "on your keep
+list (every version of this item)", and unlocking one removes the whole entry.
+
 ## Commands
 
 ```
 /de                       open the window
-/de trash                 open the window on the Trash tab
-/de run                   open the window on the Run tab
+/de trash                 open the window on the Cleanup tab
+/de run                   open the live Split inventory
+/de history               open archived run history
 /de scan                  print the verdicts to chat
-/de keep <#id|name:text>  never disenchant this
+/de keep <#id|name:text>  never disenchant this (an id covers every version)
+/de keep [item link]      never disenchant that exact version (shift-click it)
 /de keep del <n>          drop keep-list entry n
 /de keeps                 list the keep list
 /de value <gold>          BoE value that needs a Ctrl-click (0 = off)
@@ -211,10 +238,13 @@ attributed to a disenchant by landing within ~3 seconds of your cast finishing.
 Only your own enchanting-material loot is accepted, and the pending transaction
 closes after its first accepted material line.
 
-Starting a new run archives the previous non-empty run. Up to 20 compact run
-summaries retain their name, time, roster, material totals, and drop count even
-after old audit rows roll off. Use `/de runs name <text>` to name the current
-run, `/de runs end` to archive it, and `/de runs` to list the history.
+Starting a new run archives whatever the Run Split tab was showing, if it has
+any drops — including disenchants since login when no marker was ever set. Up
+to 20 run summaries retain their name, time, roster, material totals, and drop
+count even after old audit rows roll off. They are browsable in the **History**
+tab. `/de runs end` archives the same way and leaves a fresh marker, so an
+ended run's drops never reappear in the live split; `/de runs name` and
+`/de runs clear` name the current run and wipe the history.
 
 ## Optional integrations
 
@@ -273,4 +303,4 @@ every supported branch:
    them only after they disappear. Cancel any client deletion prompt and confirm
    no success line or audit row is produced.
 5. Complete a disenchant, then loot an unrelated item immediately; confirm only
-   enchanting materials appear in `/de tally`, `/de audit`, and the Run tab.
+   enchanting materials appear in `/de tally`, `/de audit`, and the Run Split tab.
