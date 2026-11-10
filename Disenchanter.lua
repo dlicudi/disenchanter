@@ -1378,6 +1378,7 @@ local function disarmAll()
   if not win or InCombatLockdown() then return end
   for _, row in ipairs(win.rows) do arm(row, "blocked") end
   if win.next then arm(win.next, "blocked"); win.next.item = nil end
+  if win.nextKey then arm(win.nextKey, "blocked"); win.nextKey.item = nil end
 end
 
 -- Row order is held while the window stays open, so a rebuild never slides a
@@ -1480,22 +1481,62 @@ local function applyNextKey()
   -- window still counts as shown, and a key that disenchants unseen items is
   -- exactly what this must never be.
   if key and SetOverrideBindingClick and win:IsVisible() and win.tab == "de" then
-    SetOverrideBindingClick(win, true, key, "DisenchanterNextButton", "LeftButton")
+    SetOverrideBindingClick(win, true, key, "DisenchanterNextKey", "LeftButton")
   end
 end
 
---- Point the Next button at an item, or at nothing. Anything but the
---- Disenchant tab of a visible window gets nothing.
-local function syncNext(it)
-  local nb = win and win.next
+--- Light up the row the Next button points at while the mouse is over the
+--- button: that is its whole explanation, so it has no tooltip.
+local function showNextRow()
+  local nb, row = win and win.next, win and win.nextRow
+  if row and nb and nb:IsShown() and nb:IsMouseOver() and nb.item and row.item == nb.item then
+    row:LockHighlight()
+  end
+end
+local function hideNextRow()
+  if win and win.nextRow then win.nextRow:UnlockHighlight() end
+end
+
+--- Point the Next button at an item (and the row showing it), or at
+--- nothing. It works the Disenchant and Cleanup tabs of a visible window —
+--- Disenchant next on one, Destroy next on the other; every other tab gets
+--- nothing. Handed the item being disenchanted, it becomes a cancel button,
+--- like that item's row.
+---
+--- The key never presses this button: it is bound to a twin, nextKey, that
+--- is only ever armed to disenchant. Otherwise a second press of the key —
+--- the natural way to work down a list — would cancel the cast it just began.
+local function syncNext(it, row)
+  local nb, nk = win and win.next, win and win.nextKey
   if not nb or InCombatLockdown() then return end -- SetAttribute / Show are protected
-  nb:SetShown(win.tab == "de")
-  if not (win:IsVisible() and win.tab == "de") then it = nil end
+  local trash = win.tab == "trash"
+  nb:SetShown(win.tab == "de" or trash)
+  if not (win:IsVisible() and (win.tab == "de" or trash)) then it, row = nil, nil end
+  local cancel = it and it.casting and not trash
+  hideNextRow()
+  win.nextRow = it and row or nil
   nb.item = it
-  if it then arm(nb, "safe", it.bag, it.slot) else arm(nb, "blocked") end
-  local key = KEY_BADGE[db().nextKey or ""] or db().nextKey
+  if not it then
+    arm(nb, "blocked")
+  elseif cancel then
+    armCancel(nb)
+  elseif trash then
+    armTrash(nb, "safe", it.bag, it.slot)
+  else
+    arm(nb, "safe", it.bag, it.slot)
+  end
+  if nk then
+    local keyIt = (it and not trash and not cancel) and it or nil
+    nk.item = keyIt
+    if keyIt then arm(nk, "safe", keyIt.bag, keyIt.slot) else arm(nk, "blocked") end
+  end
   local label
-  if it then
+  if trash then
+    label = it and "Destroy next" or "Nothing to destroy"
+  elseif cancel then
+    label = "Cancel disenchant"
+  elseif it then
+    local key = KEY_BADGE[db().nextKey or ""] or db().nextKey
     label = "Disenchant next" .. ((key and #key <= 6) and ("  |cffd9c2f5[" .. key .. "]|r") or "")
   elseif DE.cast then
     label = "Disenchanting..."
@@ -1506,8 +1547,20 @@ local function syncNext(it)
   end
   nb.text:SetText(label)
   nb.text:SetTextColor(it and 1 or 0.5, it and 1 or 0.5, it and 1 or 0.52)
-  nb.bg:SetColorTexture(it and 0.34 or 0.11, it and 0.15 or 0.12, it and 0.50 or 0.15, 1)
-  nb.edge:SetColorTexture(it and 0.62 or 0.26, it and 0.36 or 0.28, it and 0.86 or 0.33, 1)
+  if not it then
+    nb.bg:SetColorTexture(0.11, 0.12, 0.15, 1)
+    nb.edge:SetColorTexture(0.26, 0.28, 0.33, 1)
+  elseif cancel then
+    nb.bg:SetColorTexture(0.20, 0.11, 0.28, 1)
+    nb.edge:SetColorTexture(0.62, 0.36, 0.86, 1)
+  elseif trash then
+    nb.bg:SetColorTexture(0.45, 0.13, 0.13, 1)
+    nb.edge:SetColorTexture(0.80, 0.30, 0.30, 1)
+  else
+    nb.bg:SetColorTexture(0.34, 0.15, 0.50, 1)
+    nb.edge:SetColorTexture(0.62, 0.36, 0.86, 1)
+  end
+  showNextRow()
 end
 
 --- /de key, and the Settings key button. `key` is a single key name with no
@@ -1612,6 +1665,28 @@ local function notePending(self, button)
   local now = C.GetContainerItemInfo(it.bag, it.slot)
   DE._pending = (now and now.itemID == it.itemID) and it or nil
   DE._pendingAt = GetTime()
+end
+
+--- The Cleanup tab's whole action, for a row or the Next button — deletion
+--- isn't a protected call, so no secure attributes are involved. Left-button
+--- release only, and the slot is re-read at the last instant, so the click
+--- can only ever destroy the exact item the button was showing.
+local function trashClick(self, button, down)
+  local it = self.item
+  if down or button ~= "LeftButton" or not (it and it.trash and self.trashBag) then return end
+  if it.tier ~= "safe" and not IsControlKeyDown() then return end
+  local ok, why = deleteTrash(it, self.trashBag, self.trashSlot)
+  if ok == false then
+    pr(("did not delete %s — %s. Rescan and try again."):format(it.link, why))
+    return
+  end
+  if ok == nil then
+    pr(("confirm deletion of %s in the client dialog."):format(it.link))
+    return
+  end
+  pr(("deleted %s%s%s."):format(it.link,
+    it.count > 1 and (" x" .. it.count) or "",
+    it.vendor > 0 and (" — worth " .. money(it.vendor) .. " to a vendor") or ""))
 end
 
 local TEXT_LEFT = 34   -- past the icon
@@ -1808,28 +1883,7 @@ local function itemRow(i)
   -- secure handler both cast the spell and applied it via target-bag/-slot —
   -- so for those rows this only feeds the click trace.
   row:SetScript("PostClick", function(self, button, down)
-    -- The Trash tab's whole action lives here — deletion isn't a protected
-    -- call, so no secure attributes are involved. Left-button release only,
-    -- and the slot is re-read at the last instant, so the click can only ever
-    -- destroy the exact item the row was showing.
-    if self.trashBag then
-      local it = self.item
-      if down or button ~= "LeftButton" or not (it and it.trash) then return end
-      if it.tier ~= "safe" and not IsControlKeyDown() then return end
-      local ok, why = deleteTrash(it, self.trashBag, self.trashSlot)
-      if ok == false then
-        pr(("did not delete %s — %s. Rescan and try again."):format(it.link, why))
-        return
-      end
-      if ok == nil then
-        pr(("confirm deletion of %s in the client dialog."):format(it.link))
-        return
-      end
-      pr(("deleted %s%s%s."):format(it.link,
-        it.count > 1 and (" x" .. it.count) or "",
-        it.vendor > 0 and (" — worth " .. money(it.vendor) .. " to a vendor") or ""))
-      return
-    end
+    if self.trashBag then return trashClick(self, button, down) end
     -- Disenchant rows: nothing to do. Deliberately no UseContainerItem here —
     -- it's protected, and calling it from this insecure handler only raises
     -- the "blocked from an action" popup. If the trace shows Disenchant still
@@ -1979,8 +2033,13 @@ function DE.Refresh()
   local canCast = trash or knowsDisenchant()
   -- What the Next button fires: the top Safe row, when it is on screen and
   -- nothing is mid-cast. What you can't see, the button can't touch.
-  local nextIt = (not trash and canCast and not DE.cast and not isCollapsed("safe"))
-    and safe[1] or nil
+  local nextIt
+  if trash then
+    nextIt = not isCollapsed("tsafe") and safe[1] or nil
+  else
+    nextIt = (canCast and not DE.cast and not isCollapsed("safe")) and safe[1] or nil
+  end
+  local nextRow
   local hi, ri, y = 0, 0, 0
   for _, b in ipairs(trash and TRASH_BUCKETS or BUCKETS) do
     local list = lists[b.key]
@@ -2040,7 +2099,11 @@ function DE.Refresh()
               .. (it.reason or "") .. "|r")
           end
         end
-        local tag = (it == nextIt) and "|cffb37ce8next|r" or ""
+        local tag = ""
+        if it == nextIt then
+          nextRow = row
+          tag = trash and "|cffe06060next|r" or "|cffb37ce8next|r"
+        end
         row.value:SetText(figure)
         row.tag:SetText(tag)
 
@@ -2084,7 +2147,12 @@ function DE.Refresh()
   win.content:SetHeight(math.max(-y, 1))
   win.empty:SetShown(#safe + #confirm + #blocked == 0)
   win.status:SetText(statusText(safe, confirm, blocked))
-  syncNext(nextIt)
+  -- Mid-cast the Next button cancels, aimed at the row being disenchanted.
+  if win.castingRow then
+    syncNext(win.castingRow.item, win.castingRow)
+  else
+    syncNext(nextIt, nextRow)
+  end
   if win.opts and win.opts:IsShown() then DE.RefreshOptions() end
   -- The broker always shows disenchant counts; on the trash tab it rescans.
   if trash or filterText ~= "" then DE.UpdateBroker() else DE.UpdateBroker(#safe, #confirm) end
@@ -2671,26 +2739,24 @@ local function ensureWindow()
   nb.text = nb:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   nb.text:SetPoint("CENTER", 0, 0)
   nb:SetScript("PreClick", notePending)
-  nb:SetScript("OnEnter", function(self)
-    local it = self.item
-    GameTooltip:SetOwner(self, "ANCHOR_TOP")
-    if it then
-      tipQuiet = true
-      GameTooltip:SetBagItem(it.bag, it.slot)
-      tipQuiet = false
-      GameTooltip:AddLine(" ")
-      GameTooltip:AddLine("Click to disenchant this — the top Safe row.", 0.4, 1, 0.4)
-    else
-      GameTooltip:SetText("Disenchant next", 1, 1, 1)
-      GameTooltip:AddLine("Disenchants the top row of Safe to disenchant, one item per click. Nothing to do right now.", 0.6, 0.6, 0.6, true)
-    end
-    local key = keyLabel(db().nextKey)
-    GameTooltip:AddLine(key and ("Key: " .. key .. " does the same while this tab is open.")
-      or "Set a key for this in Settings, or with /de key.", 0.6, 0.6, 0.6, true)
-    GameTooltip:Show()
+  nb:SetScript("PostClick", function(self, button, down)
+    if self.trashBag then trashClick(self, button, down) end
   end)
-  nb:SetScript("OnLeave", tipHide)
+  nb:SetScript("OnEnter", showNextRow)
+  nb:SetScript("OnLeave", hideNextRow)
   win.next = nb
+
+  -- The next-item key's own button: the same disenchant as the Next button,
+  -- but never its cancel (see syncNext). Not drawn and not mouse-clickable;
+  -- only the override binding presses it.
+  local nk = CreateFrame("Button", "DisenchanterNextKey", f, "SecureActionButtonTemplate")
+  nk:SetSize(1, 1)
+  nk:SetPoint("BOTTOMRIGHT", nb, "BOTTOMRIGHT")
+  nk:SetAlpha(0)
+  nk:EnableMouse(false)
+  nk:RegisterForClicks("AnyUp", "AnyDown")
+  nk:SetScript("PreClick", notePending)
+  win.nextKey = nk
 
   -- The Run Split tab's bottom row, swapped in for Rescan/To chat by SetTab.
   local newRun = flatButton(f, "New run", 70)

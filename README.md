@@ -28,7 +28,13 @@ top row of *Safe to disenchant* — that row is tagged `next` — so you can wor
 through a bag without moving the mouse. It is one item per click, it never
 touches a Check first or Protected item, and it does nothing while a cast is
 in progress or while the Safe section is collapsed: what you can't see, it
-can't disenchant.
+can't disenchant. Hover the button and its row lights up in the list. While
+the cast runs the button reads **Cancel disenchant**: click it again to stop.
+The key never cancels, so pressing it twice can't undo the cast it started.
+
+On the Cleanup tab the same button becomes **Destroy next**: one click deletes
+the top junk row (tagged `next`), and nothing that needs a Ctrl-click. It has
+no key — deleting stays a deliberate mouse click.
 
 You can give it a key: **Settings → Next-item key**, or `/de key F`
 (`/de key none` clears it). The key is only bound while the window is open on
@@ -373,7 +379,8 @@ every supported branch:
 5. Complete a disenchant, then loot an unrelated item immediately; confirm only
    enchanting materials appear in `/de tally`, `/de audit`, and the Run Split tab.
 6. Click **Disenchant next** and confirm it disenchants the row tagged `next`
-   and nothing else. Set a key with `/de key`, confirm it works on the
+   and nothing else, and that hovering it highlights that row. On Cleanup,
+   click **Destroy next** and confirm it deletes only the top junk row. Set a key with `/de key`, confirm it works on the
    Disenchant tab, does nothing on Cleanup, and returns to its normal binding
    when the window closes and when the interface is hidden with Alt-Z. Enter
    combat with the window open and confirm the key and a click on a Safe row

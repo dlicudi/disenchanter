@@ -125,16 +125,18 @@ step("the Next button follows the top safe row; its key only lives on the open D
     DE.SetNextKey("f");assert(d.nextKey=="F")
     DE.SetTab("de");local nb=w.next
     assert(nb:IsShown() and nb.item.itemID==11 and nb._attr.type1=="macro" and nb._attr["target-slot1"]==1)
-    assert(nb._attr["ctrl-type1"]==nil and binds.F=="DisenchanterNextButton")
+    assert(nb._attr["ctrl-type1"]==nil and binds.F=="DisenchanterNextKey" and w.nextKey._attr["target-slot1"]==1)
     assert(nb._attr.macrotext1=="/cast [nocombat] Disenchant" and w.rows[1]._attr.macrotext1==nb._attr.macrotext1)
     local timers={};local immediate=C_Timer.After;C_Timer.After=function(_,fn)timers[#timers+1]=fn end
     DE._event("BAG_UPDATE",0);assert(nb._attr.type1==nil and nb.item==nil) -- disarmed at once
     C_Timer.After=immediate;timers[1]();assert(nb._attr.type1=="macro")
-    DE.SetTab("trash");assert(not nb:IsShown() and nb._attr.type1==nil and binds.F==nil)
+    DE.SetTab("trash");assert(nb:IsShown() and nb._attr.type1==nil and binds.F==nil) -- Destroy next: no secure action, no key
     DE.SetTab("de");assert(binds.F and nb._attr["target-slot1"]==1)
     d.collapsed.safe=true;DE.Refresh();assert(nb._attr.type1==nil);d.collapsed.safe=false -- unseen is untouchable
     DE.cast={itemID=11,bag=0,slot=1,startTime=0,duration=3};DE.Refresh()
-    assert(nb._attr.type1==nil and w.rows[1].cancelCast);DE.cast=nil;DE.Refresh() -- nothing mid-cast
+    assert(nb.cancelCast and nb._attr.macrotext1=="/stopcasting" and nb._attr["target-slot1"]==nil and w.rows[1].cancelCast)
+    assert(w.nextKey._attr.type1==nil) -- the key never cancels: a second press can't undo the first
+    DE.cast=nil;DE.Refresh();assert(not nb.cancelCast and nb._attr.macrotext1~="/stopcasting")
     w:Hide();assert(nb._attr.type1==nil and binds.F==nil)
     w:Show();assert(nb._attr.type1=="macro" and binds.F)
     -- the whole UI hidden (Alt-Z): still "shown", but nothing may stay armed or bound
@@ -144,6 +146,32 @@ step("the Next button follows the top safe row; its key only lives on the open D
     DE.SetNextKey("ctrl-f");assert(d.nextKey=="F");DE.SetNextKey("BUTTON2");assert(d.nextKey=="F")
     DE.SetNextKey("none");assert(d.nextKey==nil and binds.F==nil)
   end)
+end)
+step("Destroy next deletes the top junk row on the Cleanup tab, with no key",function()
+  local w=DE._window();local numSlots,itemInfo=C_Container.GetContainerNumSlots,C_Container.GetContainerItemInfo
+  local bags={{itemID=21,stackCount=1},{itemID=22,stackCount=1}}
+  C_Container.GetContainerNumSlots=function(bag)return bag==0 and 2 or 0 end
+  C_Container.GetContainerItemInfo=function(bag,slot)return bag==0 and bags[slot] or nil end
+  ITEM_INFO=function(id)
+    id=tonumber(id) or tonumber(tostring(id):match("item:(%d+)"))
+    return "Junk"..id,"item:"..id,0,1,nil,nil,nil,nil,"",nil,id,4,1,1
+  end
+  local picked;C_Container.PickupContainerItem=function(_,slot)picked=slot end
+  CursorHasItem=function()return true end
+  DeleteCursorItem=function()bags[picked]=nil end
+  local ok,err=pcall(function()
+    if not w:IsShown() then w:Show() end
+    DE.SetTab("trash");local nb=w.next
+    assert(nb:IsShown() and nb.item and nb.item.itemID==21 and nb.trashBag==0 and nb.trashSlot==1)
+    assert(nb._attr.type1==nil and w.nextRow and w.nextRow.item==nb.item)
+    nb:GetScript("PostClick")(nb,"LeftButton",true);assert(bags[1]) -- the down edge does nothing
+    nb:GetScript("PostClick")(nb,"LeftButton",false);assert(bags[1]==nil and bags[2])
+    DE.Refresh();assert(nb.item.itemID==22)
+    DE.SetTab("de");assert(nb.trashBag==nil)
+  end)
+  C_Container.GetContainerNumSlots,C_Container.GetContainerItemInfo,ITEM_INFO=numSlots,itemInfo,nil
+  DE.Resort()
+  if not ok then error(err,0) end
 end)
 step("the loss guard asks for Ctrl only when a priced disenchant loses enough",function()
   local d=DE._db();d.guards.loss=true;d.lossSilver=50

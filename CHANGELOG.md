@@ -5,6 +5,9 @@
 - Added **Disenchant next**: a fixed button in the footer that disenchants the
   top Safe row, one item per click, with an optional key (`/de key`, or
   Settings) that is only bound while the window is open on the Disenchant tab.
+  Hovering it highlights its row in the list; clicking it again mid-cast
+  cancels (the key doesn't). On the Cleanup tab it becomes
+  **Destroy next**, deleting the top junk row (mouse only, no key).
 - Added the `loss` guard: asks for a Ctrl-click when disenchanting is estimated
   to lose more than `/de loss` silver against selling the item. Off by default.
 - Item tooltips now show what a disenchantable item turns into, what the
